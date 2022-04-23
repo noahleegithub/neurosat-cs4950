@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --job-name=gpu_sr_10_40
+#SBATCH --time=06:00:00
+#SBATCH --output=./slurm/stdout/slurm-%j.out
+#SBATCH --error=./slurm/stderr/slurm-%j.err
+#SBATCH --nodes=1
+#SBATCH --mem=32G
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+
+source activate FuzzyLogic
+python -c "import torch; print('torch cuda available:', torch.cuda.is_available())"
+python train.py ./datasets/sr_10_40 1 fuzzy_cnf r_product --batch-size=32 --shuffle --gpu --log-csv=220102_sr1040_cnf_rproduct_training0.csv
+python print_logs.py ./logs/220102_sr1040_cnf_rproduct_training0.csv

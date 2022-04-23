@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --nodes=1
+#SBATCH --mem=16G
+#SBATCH --job-name=gpu_sr_10_40
+#SBATCH --time=06:00:00
+#SBATCH --output=./slurm/stdout/slurm-%j.out
+#SBATCH --error=./slurm/stderr/slurm-%j.err
+
+source activate FuzzyLogic
+python -c "import torch; print(torch.cuda.is_available())"
+python train.py ./datasets/sr_10_40 1 minisat s_godel --batch-size=32 --shuffle --gpu --log-csv=220102_sr1040_minisat_training0.csv
+python print_logs.py ./logs/220102_sr1040_minisat_training0.csv
