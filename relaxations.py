@@ -114,7 +114,11 @@ class Lukasiewicz(FuzzyRelaxation):
         return Lukasiewicz.disjunction(Lukasiewicz.negation(a), b)
 
 
-relaxation_types = {"s_godel" : SGodel, "r_godel" : RGodel, "s_product" : SProduct, "r_product" : RProduct, "lukasiewicz" : Lukasiewicz}
+relaxation_types = {
+    "godel": SGodel, "s_godel" : SGodel, "r_godel" : RGodel, 
+    "product": SProduct, "s_product" : SProduct, "r_product" : RProduct, 
+    "lukasiewicz" : Lukasiewicz
+}
 
 if __name__ == "__main__":
     pass

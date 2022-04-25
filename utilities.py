@@ -2,9 +2,12 @@ import numpy as np
 import torch
 from torch import Tensor
 from typing import Sequence, Tuple
+from sympy import Symbol
+from sympy.logic.boolalg import BooleanFunction, And, Or, Not, Implies
+from relaxations import FuzzyRelaxation, relaxation_types
 
 def dimacs_to_adjacency(in_fname: str, sparse: bool=True):
-    """ Reads the given file in DIMACS format into a sparse Tensor.
+    """ Reads the given file in DIMACS format into a Tensor.
         The shape of the tensor is (2n, m), where n is the number of literals and m
         the number of clauses.
     """
@@ -28,6 +31,13 @@ def dimacs_to_adjacency(in_fname: str, sparse: bool=True):
             adj_tensor = adj_tensor.to_sparse()
         return adj_tensor
 
+def pad_sparse_matrix(matrix: Tensor, new_w, new_h) -> Tensor:
+    return torch.sparse_coo_tensor(
+            indices=matrix.indices(),
+            values=torch.ones(len(matrix.values())),
+            size=(new_w, new_h)
+        )
+
 def direct_sum(matrices: Sequence[Tensor]) -> Tensor:
     row_indices = []
     col_indices = []
@@ -49,19 +59,68 @@ def direct_sum(matrices: Sequence[Tensor]) -> Tensor:
             dtype=torch.float32)
 
 
-def compute_acc(predictions, lit_sizes, discriminators):
-    lit_index = 0
-    num_correct = 0
-    for lits_size, discrim in zip(lit_sizes, discriminators):
-        pred = predictions[0 + lit_index : lits_size + lit_index]
-        lit_index += lits_size
-        satisfies = discrim(pred)
-        satisfies = 1 if satisfies > 0.5 else 0 
-        num_correct += satisfies
-    accuracy = num_correct / len(lit_sizes)
-    return accuracy
+def compute_acc(votes, sats, assignments, formulas, device):
+    satisfying_assignments_found = 0 # if the problem was SAT and a valid assigment was found
+    relaxation = relaxation_types['godel']
+    votes = torch.where(votes > 0.5, 1., 0.)
+    correct_sat_predictions = torch.sum(votes == sats)
 
-        
+    for sat, assignment, formula in zip(sats, assignments, formulas):
+        if sat == 1:
+            assignment = torch.where(assignment > 0.5, 1., 0.)
+            if relax_sympy(formula, relaxation, assignment, device) == 1:
+                satisfying_assignments_found += 1
+    return correct_sat_predictions, satisfying_assignments_found
+
+def extract_int_from_str(s):
+    """ Get the integer that is present in the given string. 
+    """
+    try:
+        return int(''.join(filter(str.isdigit, s)))
+    except ValueError:
+        raise ValueError("string did not contain an int.")
+
+def relax_sympy(expr: BooleanFunction, relaxation_t: FuzzyRelaxation, values: torch.Tensor, device):
+    """ Using the given relaxation of logic and SymPy expression, computes the value of the overall expression. 
+    Args: 
+        expr (BooleanFunction): A SymPy boolean expression in NNF form (And, Or, or Not).
+            Not can only be applied to literals.
+        relaxation_t (FuzzyRelaxation): Class with real-valued logic implementations of conjunction, 
+            disjunction and negation.
+        values (Tensor[float]): A tensor that contains floats 0 <= x <= 1. Length of values should at least
+            be one greater than the max variable in expr.
+    """
+    if isinstance(expr, And):
+        children = expr.args
+        ret_value = torch.tensor(1.).to(device)
+        for child in children:
+            ret_value = relaxation_t.conjunction(ret_value, relax_sympy(child, relaxation_t, values, device))
+        return ret_value
+    elif isinstance(expr, Or):
+        children = expr.args
+        ret_value = torch.tensor(0.).to(device)
+        for child in children:
+            ret_value = relaxation_t.disjunction(ret_value, relax_sympy(child, relaxation_t, values, device))
+        return ret_value
+    elif isinstance(expr, Not):
+        child = expr.args[0]
+        ret_value = relaxation_t.negation(relax_sympy(child, relaxation_t, values, device))
+        return ret_value
+    elif isinstance(expr, Implies):
+        children = expr.args
+        ret_value = relaxation_t.implication(
+            relax_sympy(children[0], relaxation_t, values, device), 
+            relax_sympy(children[1], relaxation_t, values, device))
+        return ret_value
+    elif isinstance(expr, Symbol):
+        symbol_num = extract_int_from_str(str(expr))
+        ret_value = values[symbol_num - 1]
+        return ret_value
+    elif isinstance(expr, BooleanTrue):
+        return torch.tensor(1.).to(device)
+    else:
+        raise ValueError("Expression is invalid")
+    
 if __name__ == "__main__":
     test_cnf1 = "./dataset/development/sr_n=0003_pk2=0.30_pg=0.40_t=0_sat=1.dimacs"
     test_cnf2 = "./dataset/development/sr_n=0003_pk2=0.30_pg=0.40_t=1_sat=1.dimacs"
