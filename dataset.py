@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 from typing import Sequence, Tuple
 from torch.utils.data import Dataset
@@ -43,9 +44,70 @@ def collate_adjacencies(batch: Sequence[Tuple[Tensor, BooleanFunction, int]]) ->
             padded_matrices.append(pad_sparse_matrix(m, max_l, max_c))
         else:
             padded_matrices.append(F.pad(m, (0, max_c - m.shape[1], 0, max_l - m.shape[0])))
-    return torch.stack(padded_matrices), torch.tensor(num_literals), formulas, torch.tensor(sats).float()
+    return torch.stack(padded_matrices), torch.tensor(num_literals).int(), formulas, torch.tensor(sats).float()
 
+class MSLR10KDataset(Dataset):
+    
+    def __init__(self, root_dir, folds, partition: str, seed=None, mode="list"):
+        super().__init__()
+        if len(folds) == 0 or partition not in ["train", "validation", "test"]:
+            raise ValueError()
+        self.queries = {}
+        self.rng = np.random.default_rng(seed)
+        self.mode = mode
 
+        for fold in folds:
+            file_path = os.path.join(root_dir, fold, partition + ".txt")
+            with open(file_path) as f:
+                for line in f.readlines():
+                    label, line = line.split(' ', 1)
+                    label = int(label)
+
+                    qid, line = line.split(' ', 1)
+                    _, qid = qid.split(':')
+                    qid = int(qid)
+
+                    self.queries[qid] = self.queries.get(qid, {})
+                    self.queries[qid][label] = self.queries[qid].get(label, [])
+
+                    feature_vec = []
+                    for feature in line.split():
+                        idx, val = feature.split(':')
+                        feature_vec.append(float(val))
+                    self.queries[qid][label].append(feature_vec)
+        for qid, query in dict(self.queries).items():
+            for label in range(5):
+                if label not in query:
+                    del self.queries[qid]
+                    break
+                self.queries[qid][label] = np.array(self.queries[qid][label])
+        self.idx2qid = {idx: key for idx, key in enumerate(self.queries.keys())}
+        
+
+    def __len__(self):
+        return len(self.queries)
+    
+    def __getitem__(self, idx):
+        query = self.queries[self.idx2qid[idx]]
+        if self.mode == "list":
+            permuted_indices = self.rng.permutation(5)
+            sorted_results = np.zeros((5, 136))
+            sorted_idxs = np.arange(5)[::-1]
+            for label in range(5):
+                sorted_results[4 - label] = self.rng.choice(query[label])
+            # [4,3,2,1,0] -> permute -> [2,4,3,1,0] -> argsort -> [1,2,0,3,4]
+            permuted_vectors = sorted_results[permuted_indices]
+            permuted_vectors = (permuted_vectors - permuted_vectors.mean(axis=1, keepdims=True)) / permuted_vectors.std(axis=1, keepdims=True)
+            return permuted_vectors, np.argsort(sorted_idxs[permuted_indices])[::-1]
+        elif self.mode == "pair":
+            relevances = self.rng.choice(5, size=2, replace=False)
+            pair = np.zeros((2, 136))
+            pair[0] = self.rng.choice(query[relevances[0]])
+            pair[1] = self.rng.choice(query[relevances[1]])
+            pair = (pair - pair.mean(axis=1, keepdims=True)) / pair.std(axis=1, keepdims=True)
+            return pair, 1. if relevances[0] > relevances[1] else 0.
+        else:
+            raise ValueError("not a valid return mode for MSLR10K")
 
 if __name__ == "__main__":
     nsat = NeuroSATDataset("./datasets/development", "train")
@@ -57,3 +119,8 @@ if __name__ == "__main__":
     print(combined[1])
     print(combined[2])
     print(combined[3])
+
+    mslr10k = MSLR10KDataset("./datasets/MSLR-WEB10K", ["Fold1"], "train", mode="list")
+    print(len(mslr10k))
+    print(mslr10k[0])
+

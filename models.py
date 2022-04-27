@@ -11,7 +11,7 @@ from torch.nn import Module, Parameter
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from utilities import direct_sum, relax_sympy
+from utilities import direct_sum, relax_sympy, max_sat
 from relaxations import relaxation_types
 from dataset import NeuroSATDataset, collate_adjacencies
 
@@ -22,26 +22,29 @@ activations = {
 
 class MultiLayerPerceptron(Module):
 
-    def __init__(self, layer_dims: List[int], layer_activations: List[Module], p_dropout=0.0) -> None:
+    def __init__(self, layer_dims: List[int], layer_activations: List[Module], p_dropout=0.0, bias=True,
+            xavier_init=True) -> None:
         super().__init__()
         if not len(layer_dims) - 1 == len(layer_activations):
             raise ValueError("len(layer_dims) - 1 must equal len(layer_activations)")
+        self.xavier_init = xavier_init
         
         modules = []
         for i in range(len(layer_dims) - 1):
-            modules.append(nn.Linear(layer_dims[i], layer_dims[i + 1]))
+            modules.append(nn.Linear(layer_dims[i], layer_dims[i + 1], bias=bias))
             if i != len(layer_dims) - 2:
                 modules.append(nn.Dropout(p=p_dropout))
             modules.append(layer_activations[i])
 
         self.layers = nn.Sequential(*modules)
-        self.layers.apply(MultiLayerPerceptron.init_weights)
+        self.layers.apply(self.init_weights)
 
-    @staticmethod
-    def init_weights(module):
+    def init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.xavier_uniform_(module.weight)
-            module.bias.data.fill_(0.01)
+            if self.xavier_init:
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    module.bias.data.fill_(0.01)
 
     def forward(self, input: Tensor) -> Tensor:
         return self.layers(input)
@@ -51,6 +54,7 @@ class NeuroSATAssign(Module):
 
     def __init__(self, config) -> None:
         super().__init__()
+        self.config = config
         embedding_dim = config.model.embedding_dim
         mlp_n_layers = config.model.mlp_hidden_layers
         mlp_activation = activations[config.model.mlp_activation]
@@ -59,13 +63,15 @@ class NeuroSATAssign(Module):
         self.embedding_dim = embedding_dim
         self.iterations = config.model.lstm_iters
 
-        self.L_init = Parameter(torch.normal(0, 1, (1, embedding_dim), requires_grad=True) / math.sqrt(embedding_dim))
-        self.C_init = Parameter(torch.normal(0, 1, (1, embedding_dim), requires_grad=True) / math.sqrt(embedding_dim))
+        self.L_init = Parameter(torch.normal(0, 1, (1, embedding_dim)) / math.sqrt(embedding_dim))
+        self.C_init = Parameter(torch.normal(0, 1, (1, embedding_dim)) / math.sqrt(embedding_dim))
 
         layer_dims = [embedding_dim] * (mlp_n_layers + 1)
         layer_activations = ([mlp_activation] * (mlp_n_layers - 1)) + [nn.Identity()] 
-        self.LC_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout)
-        self.CL_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout)
+        self.LC_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout,
+                xavier_init=config.model.xavier_init)
+        self.CL_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout,
+                xavier_init=config.model.xavier_init)
 
         self.L_update = LayerNormLSTMCell(input_size=2*embedding_dim, hidden_size=embedding_dim, 
                 activation=lstm_activation, p_dropout=config.model.lstm_dropout)
@@ -75,14 +81,17 @@ class NeuroSATAssign(Module):
         self.L_attention = CausalSelfAttention(config.model.attention_nheads, 2*embedding_dim, 
                 attn_pdrop=config.model.attention_pdrop)
         self.L_assignments = MultiLayerPerceptron(
-                [2*embedding_dim, embedding_dim, 1], [mlp_activation, activations['sigmoid']], 
-                p_dropout=config.model.mlp_dropout)
+                [2*embedding_dim]+[embedding_dim]*(mlp_n_layers-1)+[1], 
+                [mlp_activation]*(mlp_n_layers-1)+[activations['sigmoid']], 
+                p_dropout=config.model.mlp_dropout, xavier_init=config.model.xavier_init)
         self.L_vote = MultiLayerPerceptron(
-                [2*embedding_dim, embedding_dim, 1], [mlp_activation, activations['sigmoid']], 
-                p_dropout=config.model.mlp_dropout)
+                [2*embedding_dim]+[embedding_dim]*(mlp_n_layers-1)+[1], 
+                [mlp_activation]*(mlp_n_layers-1)+[activations['sigmoid']], 
+                p_dropout=config.model.mlp_dropout, xavier_init=config.model.xavier_init)
 
 
     def forward(self, adjacency_matrices: Tensor, batch_lit_counts: Tensor, device=torch.device("cpu")):
+
         self.device = device
         # adjacency_matrices: B x L x C
         B, L, C = adjacency_matrices.size()
@@ -99,16 +108,21 @@ class NeuroSATAssign(Module):
         lit_readouts = torch.cat((L_state_final[0], torch.matmul(flip, L_state_final[0])), dim=2) # B x L x 2D
         lit_readouts = self.pos_lit_select(lit_readouts, batch_lit_counts) # B x L//2 x 2D
 
-        mask = self.literal_mask(batch_lit_counts // 2).to(device)
-        lit_readouts = self.L_attention(lit_readouts, mask=mask) # B x L//2 x 2D
+        mask = self.literals_mask_1d((batch_lit_counts / 2).int()).to(device)
         
-        assignments = []
-        votes = []
-        for idx, batch_lits in enumerate(batch_lit_counts.data):
-            assignments.append(self.L_assignments(lit_readouts[idx][:batch_lits//2]).squeeze(1)) # (L//2, 2D) -> (L//2, 1)
-            votes.append(torch.mean(self.L_vote(lit_readouts[idx][:batch_lits//2])))
-        
-        return torch.stack(votes).float(), assignments
+        assignments = self.L_assignments(lit_readouts)
+ 
+        if self.config.model.use_attention:
+            lit_readouts = self.L_attention(lit_readouts, mask=mask) # B x L//2 x 2D
+
+        votes = self.L_vote(lit_readouts)
+
+        assignments = assignments.squeeze(-1).masked_fill(mask == 0., 0.)
+        votes = votes.squeeze(-1).masked_fill(mask == 0., 0.)
+
+        vote_means = torch.sum(votes, axis=1) / (batch_lit_counts / 2)
+
+        return vote_means, assignments
 
     def iterate(self, adjacency_matrices, L_state_init, C_state_init, flip_mtrx):
         L_state = L_state_init
@@ -147,15 +161,11 @@ class NeuroSATAssign(Module):
         masks = torch.stack(masks).unsqueeze(2).to(self.device)
         return torch.where(masks, lit_embeddings, torch.zeros_like(lit_embeddings))
 
-    def literal_mask(self, batch_counts) -> Tensor:
-        masks = []
-        for b_n in batch_counts:
-            mask = []
-            mask.extend([1] * b_n)
-            mask.extend([0] * (max(batch_counts) - b_n))
-            mask = torch.tensor(mask)
-            masks.append(mask)
-        return torch.stack(masks).float()
+    def literals_mask_1d(self, batch_counts) -> Tensor:
+        masks = torch.zeros(size=(len(batch_counts), torch.max(batch_counts)), dtype=torch.float32)
+        for b_idx, b_n in enumerate(batch_counts):
+            masks[b_idx][0 : b_n] = 1.
+        return masks # B x L
             
 
 class LayerNormLSTMCell(Module):
@@ -219,11 +229,11 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         if mask is not None:
-            square_mask = torch.matmul(mask.view(B, -1, 1), mask.view(B, 1, -1))
+            square_mask = torch.matmul(mask.view(B, -1, 1), mask.view(B, 1, -1)) # (B,T,1) x (B, 1, T) -> (B, T, T)
             square_mask = square_mask.unsqueeze(dim=1)
             att = att.masked_fill(square_mask == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
-        att = att.masked_fill(att.isnan(), float(0))
+        att = att.masked_fill(att.isnan(), 0.)
 
         att = self.attn_drop(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -240,13 +250,12 @@ class NeuroSATLoss(Module):
         self.relaxation_t = relaxation_types[config.general.relaxation]
         self.criterion = nn.BCELoss()
 
-    def forward(self, assignments, formulas, device):
-        satisfactions = []
-        for var_assign, formula in zip(assignments, formulas):
-            satisfaction = relax_sympy(formula, self.relaxation_t, var_assign, device)
-            satisfactions.append(satisfaction)
-        loss = self.criterion(torch.stack(satisfactions), torch.ones(len(assignments)).to(device))
-        return loss
+    def forward(self, assignments, formulas, sats, device):
+        
+        max_satisfactions = torch.tensor([len(f.args) for f in formulas], device=device).float()
+        satisfactions = torch.tensor([max_sat(f, a, device) for a, f in zip(assignments, formulas)], device=device)
+        loss = max_satisfactions - satisfactions
+        return torch.mean(loss)
 
 
 if __name__ == "__main__":
@@ -262,10 +271,17 @@ if __name__ == "__main__":
     
     model = NeuroSATAssign(config)
     print(model)
-    print(model.parameters())
+    optim = torch.optim.Adam(model.parameters())
+    optim.zero_grad()
+
     votes, assignments = model(adjacencies, literals)
     print(votes, assignments)
     print(assignments[0].shape, assignments[1].shape)
-    (assignments[0].mean() + assignments[1].mean()).backward()
-    print(adjacencies.grad)
+    #torch.sum(assignments[0] + assignments[1]).backward()
+
+    #print(model.L_init)
+    #optim.step()
+    #print(model.L_init)
+    #print(adjacencies.grad)
+    print(model.L_assignments(torch.zeros(256)))
 
