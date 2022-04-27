@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sgodel_sr_10_40
+#SBATCH --job-name=train_model.sh
 #SBATCH --time=08:00:00
 #SBATCH --output=./slurm/slurm-%j.out
 #SBATCH --error=./slurm/slurm-%j.err
@@ -9,5 +9,7 @@
 #SBATCH --gres=gpu:1
 
 source activate FuzzyLogic
-python -c "import torch; print(torch.cuda.is_available())"
-python train.py config.yaml
+
+python train.py configurations/config_3.yaml
+
+

@@ -10,4 +10,5 @@
 
 source activate FuzzyLogic
 python -c "import torch; print(torch.cuda.is_available())"
-python train.py config.yaml
+python lr_finding.py config.yaml > lr_results_new_architecture.txt
+
