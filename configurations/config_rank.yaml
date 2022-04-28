@@ -3,12 +3,16 @@ general:
   partition: "train"
   folds: ["Fold1"]
   seed: 0
-  mode: "pair"
+  mode: "list"
   run_eval_mode: False
+  list_length: 20
   k: 10
+  relevance_threshold: 3 # doc is relevant if relevance >= this threshold
+  debug: True
+  debug_freq: 100 # print debug statements every N steps
 
 training:
-    epochs: 40
+    epochs: 50
     batch_size: 100
     shuffle: True
     num_workers: 8
@@ -22,15 +26,15 @@ training:
 
 logging:
     save_checkpoint: True # save a checkpoint every epoch
-    experiment_tag: 'direct_ranker_pairs'
+    experiment_tag: 'direct_ranker_lists_train'
     load_checkpoint: False # use a saved checkpoint
-    resume_training: True # if false, discard everything except model weights
-    load_from_tag: 'your_previous_experiment_model' # if you want to load from prev experiment
+    resume_training: False # if false, discard everything except model weights
+    load_from_tag: 'direct_ranker_lists' # if you want to load from prev experiment
 
 rank_model:
   xavier_init: False
   input_dim: 136
   mlp_n_layers: 3
   mlp_hidden_dim: 128
-  mlp_p_dropout: 0.0
+  mlp_p_dropout: 0.1
   leaky_slope: 0.01

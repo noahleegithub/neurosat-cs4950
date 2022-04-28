@@ -50,7 +50,7 @@ class MSLR10KDataset(Dataset):
     
     def __init__(self, root_dir, folds, partition: str, seed=None, mode="list", k=10):
         super().__init__()
-        if len(folds) == 0 or partition not in ["train", "validation", "test"]:
+        if len(folds) == 0 or partition not in ["train", "vali", "test"]:
             raise ValueError()
         self.queries = {}
         self.rng = np.random.default_rng(seed)
@@ -80,8 +80,7 @@ class MSLR10KDataset(Dataset):
         for qid, query in dict(self.queries).items():
             for label in range(5):
                 if label not in query:
-                    del self.queries[qid]
-                    break
+                    continue
                 self.queries[qid][label] = np.array(self.queries[qid][label])
         self.idx2qid = {idx: key for idx, key in enumerate(self.queries.keys())}
         
@@ -93,7 +92,7 @@ class MSLR10KDataset(Dataset):
         query = self.queries[self.idx2qid[idx]]
         if self.mode == "list":
             sorted_results = np.zeros((self.k, self.d))
-            sorted_relevances = np.sort(self.rng.choice(5, size=self.k))[::-1]
+            sorted_relevances = np.sort(self.rng.choice(list(query.keys()), size=self.k))[::-1]
             for idx, relevance in enumerate(sorted_relevances):
                 sorted_results[idx] = self.rng.choice(query[relevance])
 
