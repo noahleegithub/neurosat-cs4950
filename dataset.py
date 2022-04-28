@@ -48,7 +48,7 @@ def collate_adjacencies(batch: Sequence[Tuple[Tensor, BooleanFunction, int]]) ->
 
 class MSLR10KDataset(Dataset):
     
-    def __init__(self, root_dir, folds, partition: str, seed=None, mode="list"):
+    def __init__(self, root_dir, folds, partition: str, seed=None, mode="list", k=10):
         super().__init__()
         if len(folds) == 0 or partition not in ["train", "validation", "test"]:
             raise ValueError()
@@ -56,6 +56,7 @@ class MSLR10KDataset(Dataset):
         self.rng = np.random.default_rng(seed)
         self.mode = mode
         self.d = 136
+        self.k = k
 
         for fold in folds:
             file_path = os.path.join(root_dir, fold, partition + ".txt")
@@ -88,15 +89,15 @@ class MSLR10KDataset(Dataset):
     def __len__(self):
         return len(self.queries)
     
-    def __getitem__(self, idx, k=10):
+    def __getitem__(self, idx):
         query = self.queries[self.idx2qid[idx]]
         if self.mode == "list":
-            sorted_results = np.zeros((k, self.d))
-            sorted_relevances = np.sort(self.rng.choice(5, size=k))[::-1]
+            sorted_results = np.zeros((self.k, self.d))
+            sorted_relevances = np.sort(self.rng.choice(5, size=self.k))[::-1]
             for idx, relevance in enumerate(sorted_relevances):
                 sorted_results[idx] = self.rng.choice(query[relevance])
 
-            permuted_indices = self.rng.permutation(k)
+            permuted_indices = self.rng.permutation(self.k)
 
             permuted_vectors = sorted_results[permuted_indices]
             permuted_vectors = (permuted_vectors - permuted_vectors.mean(axis=1, keepdims=True)) / permuted_vectors.std(axis=1, keepdims=True)

@@ -133,17 +133,17 @@ def max_sat(cnf: BooleanFunction, values: Tensor, device):
         satisfaction += torch.minimum(torch.sum(variables), torch.tensor(1, device=device))
     return satisfaction
 
-def ndcg_score(relevance_ranking: Sequence[float], optimal_ranking: Sequence[float]=None, k: int=None):
+def ndcg_score(relevance_ranking: Tensor, optimal_ranking: Tensor=None, k: int=None, device=torch.device("cpu")):
     if k is None or k > len(relevance_ranking):
         k = len(relevance_ranking)
     if optimal_ranking is None:
-        optimal_ranking = np.sort(relevance_ranking)[::-1]
+        optimal_ranking, _ = torch.sort(relevance_ranking, descending=True)
 
     def dcg_score(relevance_ranking):
-        scores = np.array(relevance_ranking) / np.log2(np.arange(2, len(relevance_ranking) + 2))
-        return np.sum(scores[:k])
+        scores = torch.div(relevance_ranking[:k], torch.log2(torch.arange(2, k+2, device=device, dtype=torch.float32)))
+        return torch.sum(scores)
     dcg = dcg_score(relevance_ranking)
-    idcg = dcg_score(np.sort(relevance_ranking)[::-1])
+    idcg = dcg_score(optimal_ranking)
     return dcg / idcg
 
 def combinations_2(data: np.ndarray, batched=True):

@@ -62,7 +62,7 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
 
         pairwise_targets = torch.where(pairwise_targets[:,:,0] > pairwise_targets[:,:,1], 1., 0.) # (B, NC2)
         pairwise_predictions = model(pairwise_features).squeeze() # (B, NC2, 2, D) -> (B, NC2, 1) -> (B, NC2)
-
+        
         # backprop
         loss = criterion(pairwise_predictions, pairwise_targets)
         loss.backward()
@@ -78,7 +78,7 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
             permuted_relevances = targets[batch] # (N,)
             model_predictions = pairwise_predictions[batch] # (NC2)
             lookup_table = np.zeros((N, N))
-            for idx, x, y in enumerate(pairwise_indices):
+            for idx, (x, y) in enumerate(pairwise_indices):
                 lookup_table[x, y] = model_predictions[idx]
                 lookup_table[y, x] = -1 * model_predictions[idx]
 
@@ -87,14 +87,14 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
 
             relevances_argsort = sorted(np.arange(N), key=cmp_to_key(pairwise_comparator), reverse=True)
             resorted_relevances = permuted_relevances[relevances_argsort]
-            batch_ndcg += ndcg_score(resorted_relevances)
+            batch_ndcg += ndcg_score(resorted_relevances, device=device)
             
 
         results = {
             'step': step_no,
             'accuracy': 0, 
             'loss': loss.item(),
-            'ndcg': batch_ndcg / B,
+            'ndcg': (batch_ndcg / B).item(),
         }
     else:
         raise NotImplementedError()
@@ -112,7 +112,7 @@ def run_epoch(step_no, dataloader, model, optimizer, criterion, config, device):
 
     with tqdm(dataloader) as pbar:
         model = model.to(device)
-        def run_batch():
+        def run_batch(step_no):
             for batch in pbar:
                 step_no, results = train_step(step_no, batch, model, optimizer, criterion, config, device)
                 pbar.set_postfix(results)
@@ -120,14 +120,15 @@ def run_epoch(step_no, dataloader, model, optimizer, criterion, config, device):
                 accuracies.append(results['accuracy'])
                 losses.append(results['loss'])
                 ndcgs.append(results['ndcg'])
+            return step_no
 
         if not config.general.run_eval_mode: # train mode
             model.train()
-            run_batch()
+            step_no = run_batch(step_no)
         else: # eval mode
             model.eval()
             with torch.no_grad():
-                run_batch
+                step_no = run_batch(step_no)
 
     epoch_results = {
         'epoch acc': np.mean(accuracies),
@@ -149,7 +150,7 @@ if __name__ == "__main__":
    
     # create datasets
     dataset = MSLR10KDataset(root_dir=config.general.dataset_root, folds=config.general.folds,
-        partition=config.general.partition, seed=config.general.seed, mode=config.general.mode)
+        partition=config.general.partition, seed=config.general.seed, mode=config.general.mode, k=config.general.k)
 
     # create dataloaders
     dataloader = DataLoader(dataset, batch_size=config.training.batch_size, shuffle=config.training.shuffle,

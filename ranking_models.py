@@ -14,15 +14,16 @@ class DirectRanker(nn.Module):
         p_drop = config.rank_model.mlp_p_dropout
         xavier = config.rank_model.xavier_init
         self.doc_ffnn = MultiLayerPerceptron(layer_dims=[in_dim]+[hidden_dim]*n_layers,
-            layer_activations=[nn.ReLU()]*n_layers, p_dropout=p_drop, xavier_init=xavier)
+            layer_activations=[nn.LeakyReLU(negative_slope=config.rank_model.leaky_slope)]*n_layers, 
+            p_dropout=p_drop, xavier_init=xavier)
         self.out_ffnn = MultiLayerPerceptron(layer_dims=[hidden_dim, 1], layer_activations=[nn.Identity()],
             p_dropout=p_drop, bias=False, xavier_init=xavier)
 
     def forward(self, docs: Tensor):
-        B, N, D = docs.size()
+        N = docs.shape[-2]
         assert N == 2
-        doc1 = docs[:, 0]
-        doc2 = docs[:, 1]
+        doc1 = docs[..., 0, :]
+        doc2 = docs[..., 1, :]
 
         doc1 = self.doc_ffnn(doc1)
         doc2 = self.doc_ffnn(doc2)
