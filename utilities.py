@@ -146,6 +146,16 @@ def ndcg_score(relevance_ranking: Sequence[float], optimal_ranking: Sequence[flo
     idcg = dcg_score(np.sort(relevance_ranking)[::-1])
     return dcg / idcg
 
+def combinations_2(data: np.ndarray, batched=True):
+    if batched:
+        n = data.shape[1]
+    else:
+        n = data.shape[0]
+    combinations = np.transpose(np.triu_indices(n, 1))
+    if batched:
+        return data[:, combinations]
+    else:
+        return data[combinations]
 
     
 if __name__ == "__main__":

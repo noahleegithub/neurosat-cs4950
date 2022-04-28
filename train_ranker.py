@@ -1,5 +1,7 @@
 import argparse
 import csv
+from itertools import combinations
+from functools import cmp_to_key
 import yaml
 import json
 import os
@@ -13,7 +15,7 @@ from dataset import MSLR10KDataset
 from torch.utils.data import DataLoader
 from torch import nn
 from ranking_models import DirectRanker
-from utilities import compute_acc
+from utilities import compute_acc, combinations_2, ndcg_score
 from discriminators import discriminator_types
 from relaxations import relaxation_types
 
@@ -30,28 +32,73 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
     optimizer.zero_grad()
     features, targets = data_in
     features, targets = features.float().to(device), targets.float().to(device)
-
     assert not torch.any(torch.isnan(features))
 
-    with torch.cuda.amp.autocast():
-        predictions = model(features).squeeze()
+    if config.general.mode == "pair":
+        with torch.cuda.amp.autocast():
+            predictions = model(features).squeeze() # (B, 2, D) -> (B, 1) -> (B,)
 
+            loss = criterion(predictions, targets)
+            loss.backward()
+            if not config.general.run_eval_mode:
+                if config.training.optimizer.use_grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
+            optimizer.step()    
+            
+        predictions = torch.where(predictions > 0, 1., 0.)
+        correct = predictions == targets
 
-        loss = criterion(predictions, targets)
+        results = {
+            'step': step_no,
+            'accuracy': (torch.sum(correct) / len(correct)).item(), 
+            'loss': loss.item(),
+            'ndcg': 0,
+        }
+    elif config.general.mode == "list":
+        B, N, D = features.shape
+        pairwise_indices = combinations_2(np.arange(N), batched=False) # (NC2, 2)
+        pairwise_features = combinations_2(features) # (B, NC2, 2, D)
+        pairwise_targets = combinations_2(targets) # (B, NC2, 2)
+
+        pairwise_targets = torch.where(pairwise_targets[:,:,0] > pairwise_targets[:,:,1], 1., 0.) # (B, NC2)
+        pairwise_predictions = model(pairwise_features).squeeze() # (B, NC2, 2, D) -> (B, NC2, 1) -> (B, NC2)
+
+        # backprop
+        loss = criterion(pairwise_predictions, pairwise_targets)
         loss.backward()
         if not config.general.run_eval_mode:
             if config.training.optimizer.use_grad_clip:
                 nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
         optimizer.step()    
-        
-    predictions = torch.where(predictions > 0, 1., 0.)
-    correct = predictions == targets
+        # backprop
 
-    results = {
-        'step': step_no,
-        'accuracy': (torch.sum(correct) / len(correct)).item(), 
-        'loss': loss.item(),
-    }
+        batch_ndcg = 0
+
+        for batch in range(B):
+            permuted_relevances = targets[batch] # (N,)
+            model_predictions = pairwise_predictions[batch] # (NC2)
+            lookup_table = np.zeros((N, N))
+            for idx, x, y in enumerate(pairwise_indices):
+                lookup_table[x, y] = model_predictions[idx]
+                lookup_table[y, x] = -1 * model_predictions[idx]
+
+            def pairwise_comparator(x, y):
+                return lookup_table[x, y]
+
+            relevances_argsort = sorted(np.arange(N), key=cmp_to_key(pairwise_comparator), reverse=True)
+            resorted_relevances = permuted_relevances[relevances_argsort]
+            batch_ndcg += ndcg_score(resorted_relevances)
+            
+
+        results = {
+            'step': step_no,
+            'accuracy': 0, 
+            'loss': loss.item(),
+            'ndcg': batch_ndcg / B,
+        }
+    else:
+        raise NotImplementedError()
+
     return step_no + 1, results
 
 
@@ -60,31 +107,32 @@ def run_epoch(step_no, dataloader, model, optimizer, criterion, config, device):
 
     accuracies = []
     losses = []
+    ndcgs = []
     csv_path = os.path.join("logs", "{}_running_results.csv".format(config.logging.experiment_tag))
 
     with tqdm(dataloader) as pbar:
         model = model.to(device)
-        if not config.general.run_eval_mode: # train mode
-            model.train()
+        def run_batch():
             for batch in pbar:
                 step_no, results = train_step(step_no, batch, model, optimizer, criterion, config, device)
                 pbar.set_postfix(results)
                 append_dict_to_csv(results, csv_path)
                 accuracies.append(results['accuracy'])
                 losses.append(results['loss'])
+                ndcgs.append(results['ndcg'])
+
+        if not config.general.run_eval_mode: # train mode
+            model.train()
+            run_batch()
         else: # eval mode
             model.eval()
             with torch.no_grad():
-                for batch in pbar:
-                    step_no, results = train_step(step_no, batch, model, optimizer, criterion, config, device)
-                    pbar.set_postfix(results)
-                    append_dict_to_csv(results, csv_path)
-                    accuracies.append(results['accuracy'])
-                    losses.append(results['loss'])
+                run_batch
 
     epoch_results = {
         'epoch acc': np.mean(accuracies),
         'epoch loss': np.mean(losses),
+        'epoch ndcg': np.mean(ndcgs),
     }
     return step_no, epoch_results
 

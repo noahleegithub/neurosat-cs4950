@@ -55,6 +55,7 @@ class MSLR10KDataset(Dataset):
         self.queries = {}
         self.rng = np.random.default_rng(seed)
         self.mode = mode
+        self.d = 136
 
         for fold in folds:
             file_path = os.path.join(root_dir, fold, partition + ".txt")
@@ -87,18 +88,19 @@ class MSLR10KDataset(Dataset):
     def __len__(self):
         return len(self.queries)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, k=10):
         query = self.queries[self.idx2qid[idx]]
         if self.mode == "list":
-            permuted_indices = self.rng.permutation(5)
-            sorted_results = np.zeros((5, 136))
-            sorted_idxs = np.arange(5)[::-1]
-            for label in range(5):
-                sorted_results[4 - label] = self.rng.choice(query[label])
-            # [4,3,2,1,0] -> permute -> [2,4,3,1,0] -> argsort -> [1,2,0,3,4]
+            sorted_results = np.zeros((k, self.d))
+            sorted_relevances = np.sort(self.rng.choice(5, size=k))[::-1]
+            for idx, relevance in enumerate(sorted_relevances):
+                sorted_results[idx] = self.rng.choice(query[relevance])
+
+            permuted_indices = self.rng.permutation(k)
+
             permuted_vectors = sorted_results[permuted_indices]
             permuted_vectors = (permuted_vectors - permuted_vectors.mean(axis=1, keepdims=True)) / permuted_vectors.std(axis=1, keepdims=True)
-            return permuted_vectors, np.argsort(sorted_idxs[permuted_indices])[::-1]
+            return permuted_vectors, sorted_relevances[permuted_indices]
         elif self.mode == "pair":
             relevances = self.rng.choice(5, size=2, replace=False)
             pair = np.zeros((2, 136))
