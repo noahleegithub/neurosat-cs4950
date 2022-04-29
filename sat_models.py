@@ -5,13 +5,12 @@ from types import SimpleNamespace
 
 import torch
 from torch import Tensor
-from torch import nn
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
 from models import activations, MultiLayerPerceptron, LayerNormLSTMCell
-from utilities import direct_sum, relax_sympy, max_sat
-from relaxations import relaxation_types
+from utilities import max_sat
+from relaxations import relaxations
 from dataset import NeuroSATDataset, collate_adjacencies
 from ranking_models import DirectRanker
 
@@ -123,16 +122,15 @@ class MaxSATLoss(Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.relaxation_t = relaxation_types[config.general.relaxation]
-        self.criterion = nn.BCELoss()
+        self.relaxation = relaxations(config)
+        self.device = torch.device("cuda" if config.training.use_cuda and torch.cuda.is_available() else "cpu")
 
-    def forward(self, assignments, formulas, sats, device):
-        
-        max_satisfactions = torch.tensor([len(f.args) for f in formulas], device=device).float()
-        satisfactions = torch.tensor([max_sat(f, a, device) for a, f in zip(assignments, formulas)], device=device)
-        loss = max_satisfactions - satisfactions
+    def forward(self, assignments, formulas):
+        assignments = torch.sigmoid(assignments)
+        sats = torch.stack([max_sat(a, f, self.relaxation, self.device) for a, f in zip(assignments, formulas)])
+        loss = 1 - sats
+        assert torch.all(loss >= 0), loss
         return torch.mean(loss)
-
 
 if __name__ == "__main__":
     with open("configurations/config_sat.yaml") as yaml_reader:
@@ -142,10 +140,11 @@ if __name__ == "__main__":
     dataset = NeuroSATDataset(root_dir="datasets/development", partition="train")
 
     adjacencies, literals, formulas, sats = collate_adjacencies([dataset[3], dataset[5]])
+
+    adjacencies = adjacencies.to(torch.device("cuda"))
     print(adjacencies.shape, literals)
-    adjacencies.requires_grad = True
     
-    model = NeuroMaxSAT(config)
+    model = NeuroMaxSAT(config).to(torch.device("cuda"))
     print(model)
     optim = torch.optim.Adam(model.parameters())
     optim.zero_grad()

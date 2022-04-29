@@ -1,12 +1,9 @@
 import argparse
-import csv
-from itertools import combinations
 from functools import cmp_to_key
 import yaml
 import json
 import os
 from types import SimpleNamespace
-import pandas as pd
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -15,17 +12,7 @@ from dataset import MSLR10KDataset
 from torch.utils.data import DataLoader
 from torch import nn
 from ranking_models import DirectRanker
-from utilities import average_precision, compute_acc, combinations_2, ndcg_score
-from discriminators import discriminator_types
-from relaxations import relaxation_types
-
-def append_dict_to_csv(results_dict, csv_path, sep=","):
-    with open(csv_path, 'a') as f:
-        writer = csv.DictWriter(f, fieldnames=list(results_dict.keys()))
-        if os.path.getsize(csv_path) == 0:
-            writer.writeheader()    
-        writer.writerow(results_dict)
-    
+from utilities import average_precision, combinations_2, ndcg_score, append_dict_to_csv
 
 def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, criterion: any, config, device=torch.device("cpu")):
 
@@ -185,7 +172,6 @@ if __name__ == "__main__":
     #criterion = lambda pred, target: torch.mean(torch.square(torch.minimum(pred * target, torch.zeros_like(pred))))
     #criterion = lambda pred, target: torch.mean(torch.minimum(pred * target, torch.zeros_like(pred)))
     criterion = nn.BCEWithLogitsLoss()
-
 
     step_no = 0
 

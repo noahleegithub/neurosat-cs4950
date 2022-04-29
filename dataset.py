@@ -9,9 +9,7 @@ from torch.nn import Module
 from sympy.logic.boolalg import BooleanFunction
 from sympy.logic.utilities import dimacs
 
-from utilities import dimacs_to_adjacency, direct_sum, pad_sparse_matrix
-from discriminators import discriminator_types
-from relaxations import relaxation_types
+from utilities import dimacs_to_adjacency, pad_sparse_matrix
 
 class NeuroSATDataset(Dataset):
     

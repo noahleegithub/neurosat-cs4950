@@ -1,10 +1,9 @@
 import argparse
-import csv
 import yaml
 import json
 import os
 from types import SimpleNamespace
-import pandas as pd
+from sat_models import MaxSATLoss
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -12,98 +11,69 @@ import numpy as np
 from dataset import NeuroSATDataset, collate_adjacencies
 from torch.utils.data import DataLoader
 from torch import nn
-from models import NeuroSATAssign, NeuroSATLoss
-from utilities import compute_acc
-from discriminators import discriminator_types
-from relaxations import relaxation_types
+from sat_models import NeuroMaxSAT
+from utilities import append_dict_to_csv, clause_accuracy
+from relaxations import relaxations
 
-def append_dict_to_csv(results_dict, csv_path, sep=","):
-    with open(csv_path, 'a') as f:
-        writer = csv.DictWriter(f, fieldnames=list(results_dict.keys()))
-        if os.path.getsize(csv_path) == 0:
-            writer.writeheader()    
-        writer.writerow(results_dict)
-    
-
-def train_step(step_no: int, data_in: any, model: nn.Module, optimizers: any, criterions: any, config, 
-    device=torch.device("cpu")):
-
-    optimizer, scaler = optimizers
-    sat_criterion, assignment_criterion = criterions
+def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, criterion: any, config, device=torch.device("cpu")):
 
     optimizer.zero_grad()
-    adj_matrices, lit_counts, formulas, sats = data_in
-    adj_matrices, lit_counts, sats = adj_matrices.to(device), lit_counts.to(device), sats.to(device)
-        
+    adj_matrices, batch_counts, formulas, sats = data_in
+    adj_matrices, sats = adj_matrices.to(device), sats.to(device)
+
     with torch.cuda.amp.autocast():
-        votes, assignments = model(adj_matrices, lit_counts, device=device)
+        assignments = model(adj_matrices, batch_counts).squeeze() # (B, L, L) -> (B, V, 1) -> (B, V)
 
-    sat_loss = sat_criterion(votes, sats)
-    assignment_loss = assignment_criterion(assignments, formulas, sats, device)
+        loss = criterion(assignments, formulas)
         
-    loss = config.training.sat_loss_a * sat_loss + config.training.assn_loss_a * assignment_loss
-        
-    if not config.general.run_eval_mode:
-        scaler.scale(loss).backward()
+        if not config.general.run_eval_mode:
+            assert loss.requires_grad, (loss, assignments)
+            loss.backward()
+            if config.training.optimizer.use_grad_clip:
+                nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
+            optimizer.step()    
+    
 
-        nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
+        batch_acc = clause_accuracy(assignments, formulas, device)
 
-        scaler.step(optimizer)
-        scaler.update()
-        
-    # TODO assure that this works correctly 
-    correct_votes, correct_assignments = compute_acc(votes, sats, assignments, formulas, device)
-        
     results = {
         'step': step_no,
-        'sat accuracy': (correct_votes / len(sats)).item(), 
-        'assignment precision': (correct_assignments / torch.sum(sats)).item(),
-        'sat loss': sat_loss.item(),
-        'assignment loss': assignment_loss.item()
+        'accuracy': batch_acc.item(), 
+        'loss': loss.item(),
     }
+
     return step_no + 1, results
 
 
 
-def run_epoch(step_no, dataloader, model, optimizers, criterions, config, device):
-    scheduler, optimizers = optimizers
+def run_epoch(step_no, dataloader, model, optimizer, criterion, config, device):
 
-    sat_accuracies = []
-    assignment_precisions = []
-    sat_losses = []
-    assignment_losses = []
+    accuracies = []
+    losses = []
     csv_path = os.path.join("logs", "{}_running_results.csv".format(config.logging.experiment_tag))
 
     with tqdm(dataloader) as pbar:
         model = model.to(device)
-        if not config.general.run_eval_mode: # train mode
-            model.train()
+        def run_batch(step_no):
             for batch in pbar:
-                step_no, results = train_step(step_no, batch, model, optimizers, criterions, config, device)
-                scheduler.step()
+                step_no, results = train_step(step_no, batch, model, optimizer, criterion, config, device)
                 pbar.set_postfix(results)
                 append_dict_to_csv(results, csv_path)
-                sat_accuracies.append(results['sat accuracy'])
-                assignment_precisions.append(results['assignment precision'])
-                sat_losses.append(results['sat loss'])
-                assignment_losses.append(results['assignment loss'])
+                accuracies.append(results['accuracy'])
+                losses.append(results['loss'])
+            return step_no
+
+        if not config.general.run_eval_mode: # train mode
+            model.train()
+            step_no = run_batch(step_no)
         else: # eval mode
             model.eval()
             with torch.no_grad():
-                for batch in pbar:
-                    step_no, results = train_step(step_no, batch, model, optimizers, criterions, config, device)
-                    pbar.set_postfix(results)
-                    append_dict_to_csv(results, csv_path)
-                    sat_accuracies.append(results['sat accuracy'])
-                    assignment_precisions.append(results['assignment precision'])
-                    sat_losses.append(results['sat loss'])
-                    assignment_losses.append(results['assignment loss'])
+                step_no = run_batch(step_no)
 
     epoch_results = {
-        'epoch sat acc': np.mean(sat_accuracies),
-        'epoch assignment precision': np.mean(assignment_precisions),
-        'epoch sat loss': np.mean(sat_losses),
-        'epoch assignment loss': np.mean(assignment_losses)
+        'epoch acc': np.mean(accuracies),
+        'epoch loss': np.mean(losses),
     }
     return step_no, epoch_results
 
@@ -126,22 +96,28 @@ if __name__ == "__main__":
             num_workers=config.training.num_workers, collate_fn=collate_adjacencies)
 
     # init model
-    model = NeuroSATAssign(config)
+    model = NeuroMaxSAT(config)
 
     #assert config.training.optimizer.step_rule == "AdamW", "AdamW is currently the only optimizer supported"
-    optimizer = torch.optim.RMSprop(model.parameters(), lr=config.training.optimizer.learning_rate, 
-            weight_decay=config.training.optimizer.weight_decay)
-    scaler = torch.cuda.amp.GradScaler()
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.training.optimizer.learning_rate,
-            total_steps=config.training.optimizer.scheduler_steps)
-    optimizers = (scheduler, (optimizer, scaler))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.optimizer.learning_rate, 
+        weight_decay=config.training.optimizer.weight_decay)
 
-    sat_criterion = nn.BCELoss()
-    assignment_criterion = NeuroSATLoss(config)
-    criterions = (sat_criterion, assignment_criterion)
+    criterion = MaxSATLoss(config)
 
     step_no = 0
+
+    if config.general.run_eval_mode:
+        assert config.logging.load_checkpoint, "Need to use a trained model for evaluation"
     
+    if config.logging.load_checkpoint:
+        checkpoint_path = os.path.join("checkpoints", "{}.ckpt".format(config.logging.load_from_tag))
+        assert os.path.isfile(checkpoint_path), "Checkpoint file does not exist"
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if config.logging.resume_training:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            step_no = checkpoint['step_no']
+
     batch_csv_path = os.path.join("logs", "{}_running_results.csv".format(config.logging.experiment_tag))
     epoch_csv_path = os.path.join("logs", "{}_epoch_results.csv".format(config.logging.experiment_tag))
     with open(batch_csv_path, 'w+') as f:
@@ -149,7 +125,17 @@ if __name__ == "__main__":
     with open(epoch_csv_path, 'w+') as f:
         pass
 
-    for epoch in tqdm(range(config.training.epochs), desc='Epoch Loop'):
-        step_no, epoch_results = run_epoch(step_no, dataloader, model, optimizers, criterions, config, device)
-        append_dict_to_csv(epoch_results, epoch_csv_path)
+    checkpoint_path = os.path.join("checkpoints", "{}.ckpt".format(config.logging.experiment_tag))
+    with tqdm(range(config.training.epochs), desc='Epoch Loop') as pbar:
+        for epoch in pbar:
+            step_no, epoch_results = run_epoch(step_no, dataloader, model, optimizer, criterion, config, device)
+            pbar.set_postfix(epoch_results)
+            append_dict_to_csv(epoch_results, epoch_csv_path)
+            if config.logging.save_checkpoint:
+                torch.save({
+                    'step_no': step_no,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'results': epoch_results,
+                }, checkpoint_path)
         

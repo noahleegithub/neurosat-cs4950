@@ -1,11 +1,20 @@
+import csv
+import os
 import numpy as np
 import torch
 from torch import Tensor
-from typing import Sequence, Tuple
+from typing import Sequence
 from sympy import Symbol
-from sympy.logic.boolalg import BooleanFunction, And, Or, Not, Implies
+from sympy.logic.boolalg import BooleanFunction, Not
 from sympy.logic.utilities import dimacs
-from relaxations import FuzzyRelaxation, relaxation_types
+from relaxations import FuzzyAggregator, Lukasiewicz
+
+def append_dict_to_csv(results_dict, csv_path, sep=","):
+    with open(csv_path, 'a') as f:
+        writer = csv.DictWriter(f, fieldnames=list(results_dict.keys()))
+        if os.path.getsize(csv_path) == 0:
+            writer.writeheader()    
+        writer.writerow(results_dict)
 
 def dimacs_to_adjacency(in_fname: str, sparse: bool=True):
     """ Reads the given file in DIMACS format into a Tensor.
@@ -59,18 +68,6 @@ def direct_sum(matrices: Sequence[Tensor]) -> Tensor:
             size=cur_size,
             dtype=torch.float32)
 
-
-def compute_acc(votes, sats, assignments, formulas, device):
-    relaxation = relaxation_types['product']
-    votes = torch.where(votes > 0.5, 1., 0.)
-    correct_sat_predictions = torch.sum(votes == sats)
-
-    assignments = torch.where(assignments > 0.5, 1., 0.)
-    satisfactions = torch.tensor([relax_sympy(f, relaxation, a, device) for a, f in zip(assignments, formulas)], 
-            device=device)
-
-    return correct_sat_predictions, torch.sum(satisfactions * sats) 
-
 def extract_int_from_str(s):
     """ Get the integer that is present in the given string. 
     """
@@ -79,59 +76,28 @@ def extract_int_from_str(s):
     except ValueError:
         raise ValueError("string did not contain an int.")
 
-def relax_sympy(expr: BooleanFunction, relaxation_t: FuzzyRelaxation, values: torch.Tensor, device):
-    """ Using the given relaxation of logic and SymPy expression, computes the value of the overall expression. 
-    Args: 
-        expr (BooleanFunction): A SymPy boolean expression in NNF form (And, Or, or Not).
-            Not can only be applied to literals.
-        relaxation_t (FuzzyRelaxation): Class with real-valued logic implementations of conjunction, 
-            disjunction and negation.
-        values (Tensor[float]): A tensor that contains floats 0 <= x <= 1. Length of values should at least
-            be one greater than the max variable in expr.
-    """
-    if isinstance(expr, And):
-        children = expr.args
-        ret_value = torch.tensor(1.).to(device)
-        for child in children:
-            ret_value = relaxation_t.conjunction(ret_value, relax_sympy(child, relaxation_t, values, device), device)
-        return ret_value
-    elif isinstance(expr, Or):
-        children = expr.args
-        ret_value = torch.tensor(0.).to(device)
-        for child in children:
-            ret_value = relaxation_t.disjunction(ret_value, relax_sympy(child, relaxation_t, values, device), device)
-        return ret_value
-    elif isinstance(expr, Not):
-        child = expr.args[0]
-        ret_value = relaxation_t.negation(relax_sympy(child, relaxation_t, values, device), device)
-        return ret_value
-    elif isinstance(expr, Implies):
-        children = expr.args
-        ret_value = relaxation_t.implication(
-            relax_sympy(children[0], relaxation_t, values, device), 
-            relax_sympy(children[1], relaxation_t, values, device), device)
-        return ret_value
-    elif isinstance(expr, Symbol):
-        symbol_num = extract_int_from_str(str(expr))
-        ret_value = values[symbol_num - 1]
-        return ret_value
-    elif isinstance(expr, BooleanTrue):
-        return torch.tensor(1.).to(device)
-    else:
-        raise ValueError("Expression is invalid")
+    
+def clause_accuracy(assignments: Tensor, formulas: Sequence[BooleanFunction], device=torch.device("cpu")):
+    relaxation = Lukasiewicz(device)
+    assignments = torch.where(assignments > 0, 1., 0.)
+    max_sats = torch.tensor([len(f.args) for f in formulas], device=device).float()
+    sats = torch.stack([max_sat(a, f, relaxation, device) for a, f in zip(assignments, formulas)])
+    accuracies = (max_sats - (1 - sats)) / max_sats
+    return torch.mean(accuracies)
 
-def max_sat(cnf: BooleanFunction, values: Tensor, device):
-    satisfaction = torch.tensor(0., device=device)
+def max_sat(values: Tensor, cnf: BooleanFunction, relaxation: FuzzyAggregator, device=torch.device("cpu")):
+    clause_satisfactions = []
     for clause in cnf.args:
         literals = clause.args
         if isinstance(clause, Symbol):
             literals = [clause]
 
-        variables = torch.tensor([values[extract_int_from_str(str(lit)) - 1] for lit in literals], device=device)
-        negated = torch.tensor([True if isinstance(lit, Not) else False for lit in literals], device=device)
+        variables = torch.stack([values[extract_int_from_str(str(lit)) - 1] for lit in literals])
+        negated = torch.tensor([isinstance(lit, Not) for lit in literals], device=device)
         variables = torch.where(negated, 1 - variables, variables)
-        satisfaction += torch.minimum(torch.sum(variables), torch.tensor(1, device=device))
-    return satisfaction
+        clause_satisfactions.append(relaxation.existential(variables))
+    cnf_satisfaction = relaxation.universal(torch.stack(clause_satisfactions))
+    return cnf_satisfaction
 
 def ndcg_score(relevance_ranking: Tensor, optimal_ranking: Tensor=None, k: int=None, debug=False):
     if k is None or k > len(relevance_ranking):
@@ -179,9 +145,10 @@ if __name__ == "__main__":
     test_cnf1 = "./tests/testformula.cnf"
     formula = dimacs.load_file(test_cnf1)
     print(formula)
-    print(relax_sympy(formula, relaxation_types['godel'], torch.tensor([.3, .2, .7, .8, 0], dtype=float), torch.device("cpu")))
     
     print(max_sat(formula, torch.tensor([.3,.2,.7,.8,.0]), torch.device("cpu")))
 
     truth = torch.tensor([3,3,3,2,2,2]).float()
     print(ndcg_score(torch.tensor([3,2,3,0,1,2]).float(), optimal_ranking=truth, debug=True))
+
+

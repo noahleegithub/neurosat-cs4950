@@ -1,167 +1,83 @@
 import torch
+from torch import Tensor
 
-class FuzzyRelaxation(object):
+def softmin(inputs: Tensor) -> Tensor:
+    return torch.exp(-1 * inputs) / torch.sum(torch.exp(-1 * inputs))
 
-    @staticmethod
-    def conjunction(a, b, device):
+class FuzzyAggregator(object):
+
+    def __init__(self, device) -> None:
+        self.device = device
+
+    def universal(self, inputs: Tensor) -> Tensor:
+        ''' Universal aggregator, i.e. "for all" in a Boolean formula. Analogous to n-ary conjunction. '''
         raise NotImplementedError()
     
-    @staticmethod
-    def disjunction(a, b, device):
+    def existential(self, inputs: Tensor) -> Tensor:
+        ''' Existential aggregator, i.e. "exists" in a Boolean formula. Analogous to n-ary disjunction. '''
         raise NotImplementedError()
 
-    @staticmethod
-    def negation(a, device):
-        return torch.sub(1, a)
+class Godel(FuzzyAggregator):
 
-    @staticmethod
-    def implication(a, b, device):
-        raise NotImplementedError()
+    def __init__(self, device, soft=False) -> None:
+        super().__init__(device)
+        self.soft = soft
 
+    def universal(self, inputs):
+        if self.soft:
+            return torch.sum(softmin(inputs) * inputs)
+        return torch.min(inputs)
 
-class SGodel(FuzzyRelaxation):
+    def existential(self, inputs):
+        if self.soft:
+            return torch.sum(torch.softmax(inputs, dim=0) * inputs)
+        return torch.max(inputs)
 
-    @staticmethod
-    def conjunction(a, b, device):
-        return torch.min(torch.cat((a.view(1), b.view(1))))
+class Product(FuzzyAggregator):
 
-    @staticmethod
-    def disjunction(a, b, device):
-        return torch.max(torch.cat((a.view(1), b.view(1))))
+    def universal(self, inputs):
+        ''' Universal aggregator, i.e. "for all" in a Boolean formula. Analogous to n-ary conjunction. 
+            This is the relaxed form, where outputs can be negative.
+        '''
+        return 1 + torch.sum(torch.log(inputs))
 
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
+    def existential(self, inputs):
+        return 1 - torch.prod(1 - inputs)
 
-    @staticmethod
-    def implication(a, b, device):
-        return SGodel.disjunction(SGodel.negation(a, device), b, device)
+class Lukasiewicz(FuzzyAggregator):
 
+    def universal(self, inputs):
+        ''' Universal aggregator, i.e. "for all" in a Boolean formula. Analogous to n-ary conjunction. 
+            This is the relaxed form, where outputs can be negative. Used in Hinge-Loss Markov Random Fields Paper
+        '''
+        return 1 - (len(inputs) - torch.sum(inputs))
+        
+    def existential(self, inputs):
+        return torch.minimum(torch.sum(inputs), torch.tensor(1, device=self.device))
 
-class RGodel(FuzzyRelaxation):
-
-    @staticmethod
-    def conjunction(a, b, device):
-        return torch.min(torch.cat((a.view(1), b.view(1))))
-
-    @staticmethod
-    def disjunction(a, b, device):
-        return torch.max(torch.cat((a.view(1), b.view(1))))
-
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
-
-    @staticmethod
-    def implication(a, b, device):
-        return torch.where(a <= b, torch.tensor(1, dtype=torch.float32, device=device), b)      
-
-
-class SProduct(FuzzyRelaxation):
-
-    @staticmethod
-    def conjunction(a, b, device):
-        return torch.mul(a, b)
-
-    @staticmethod
-    def disjunction(a, b, device):
-        return torch.sub(torch.add(a, b), torch.mul(a, b))
-
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
-
-    @staticmethod
-    def implication(a, b, device):
-        return SProduct.disjunction(SProduct.negation(a, device), b, device)
-
-
-class RProduct(FuzzyRelaxation):
-
-    @staticmethod
-    def conjunction(a, b, device):
-        return torch.mul(a, b)
-
-    @staticmethod
-    def disjunction(a, b, device):
-        return torch.sub(torch.add(a, b), torch.mul(a, b))
-
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
-
-    @staticmethod
-    def implication(a, b, device):
-        return torch.where(a <= b, torch.tensor(1, dtype=torch.float32, device=device), torch.div(b, a))
-
-
-class Lukasiewicz(FuzzyRelaxation):
-
-    @staticmethod
-    def conjunction(a, b, device):
-        return torch.max(torch.cat((torch.tensor([0], device=device), (a + b - 1).view(1))))
-
-    @staticmethod
-    def disjunction(a, b, device):
-        return torch.min(torch.cat((torch.tensor([1], device=device), (a + b).view(1))))
-
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
-
-    @staticmethod
-    def implication(a, b, device):
-        return Lukasiewicz.disjunction(Lukasiewicz.negation(a, device), b, device)
-
-class Yager(FuzzyRelaxation):
+class Yager(FuzzyAggregator):
     
-    p = 1.5
+    def __init__(self, device, p=1) -> None:
+        super().__init__(device)
+        self.p = p
 
-    @staticmethod
-    def conjunction(a, b, device):
-        p = Yager.p
-        return torch.max(torch.cat((torch.tensor([0], device=device), (1 - ((1 - a)**p + (1 - b)**p)**(1/p)).view(1))))
+    def universal(self, inputs):
+        ''' Universal aggregator, i.e. "for all" in a Boolean formula. Analogous to n-ary conjunction. 
+            This is the relaxed form, where outputs can be negative.
+        '''
+        return 1 - (len(inputs) - torch.sum(inputs**self.p)**(1 / self.p))
 
-    @staticmethod
-    def disjunction(a, b, device):
-        p = Yager.p
-        return torch.min(torch.cat((torch.tensor([1], device=device), ((a**p + b**p)**(1/p)).view(1))))
+    def existential(self, inputs):
+        return torch.minimum(torch.sum(inputs**self.p)**(1 / self.p), torch.tensor(1, device=self.device))
 
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
+def relaxations(config):
+    device = torch.device("cuda" if config.training.use_cuda and torch.cuda.is_available() else "cpu")
+    relaxation_types = {
+        "godel": Godel(device, soft=config.relaxations.godel_soft), "product": Product(device), 
+        "lukasiewicz" : Lukasiewicz(device), "yager" : Yager(device, p=config.relaxations.yager_p)
+    }
+    return relaxation_types[config.relaxations.relaxation]
 
-    @staticmethod
-    def implication(a, b, device):
-        return Yager.disjunction(Yager.negation(a, device), b, device)
-
-
-class MaxSATApprox(FuzzyRelaxation):
-    
-    @staticmethod
-    def conjunction(a, b, device):
-        return a + b
-
-    @staticmethod
-    def disjunction(a, b, device):
-        return torch.min(torch.cat((torch.tensor([1], device=device), (a + b).view(1))))
-
-    @staticmethod
-    def negation(a, device):
-        return FuzzyRelaxation.negation(a, device)
-
-    @staticmethod
-    def implication(a, b, device):
-        return Lukasiewicz.disjunction(Lukasiewicz.negation(a, device), b, device)
-
-
-
-
-relaxation_types = {
-    "godel": SGodel, "s_godel" : SGodel, "r_godel" : RGodel, 
-    "product": SProduct, "s_product" : SProduct, "r_product" : RProduct, 
-    "lukasiewicz" : Lukasiewicz, "yager" : Yager, "maxsat": MaxSATApprox
-}
 
 if __name__ == "__main__":
     pass
