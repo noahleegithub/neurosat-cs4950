@@ -62,7 +62,10 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
         pairwise_features = combinations_2(features) # (B, NC2, 2, D)
         pairwise_targets = combinations_2(targets) # (B, NC2, 2)
 
-        pairwise_targets = torch.where(pairwise_targets[:,:,0] > pairwise_targets[:,:,1], 1., 0.) # (B, NC2)
+        # if x > y, 1. if x == y, 0.5, if x < y, 0.
+        pairwise_targets = torch.where(
+            pairwise_targets[:,:,0] > pairwise_targets[:,:,1], 1., 
+                pairwise_targets[:,:,0] == pairwise_targets[:,:,1], 0.5, 0.) # (B, NC2)
         pairwise_predictions = model(pairwise_features).squeeze() # (B, NC2, 2, D) -> (B, NC2, 1) -> (B, NC2)
         
         # backprop
@@ -129,8 +132,8 @@ def run_epoch(step_no, dataloader, model, optimizer, criterion, config, device):
                 append_dict_to_csv(results, csv_path)
                 accuracies.append(results['accuracy'])
                 losses.append(results['loss'])
-                ndcgs.append(results['ndcg'])
-                maps.append(results['map'])
+                ndcgs.append(results['ndcg@{}'.format(config.general.k)])
+                maps.append(results['map@{}'.format(config.general.k)])
             return step_no
 
         if not config.general.run_eval_mode: # train mode
@@ -170,7 +173,9 @@ if __name__ == "__main__":
             num_workers=config.training.num_workers)
 
     # init model
-    model = DirectRanker(config)
+    model = DirectRanker(config.rank_model.input_dim, config.rank_model.mlp_hidden_dim, config.rank_model.mlp_n_layers, 
+        p_drop=config.rank_model.mlp_p_dropout, xavier_init=config.rank_model.xavier_init, 
+        leaky_slope=config.rank_model.leaky_slope)
 
     #assert config.training.optimizer.step_rule == "AdamW", "AdamW is currently the only optimizer supported"
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.optimizer.learning_rate, 

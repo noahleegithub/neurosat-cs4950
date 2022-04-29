@@ -1,10 +1,10 @@
 general:
   dataset_root: "datasets/MSLR-WEB10K"
-  partition: "train"
+  partition: "test"
   folds: ["Fold1"]
   seed: 0
-  mode: "list"
-  run_eval_mode: False
+  mode: "pair"
+  run_eval_mode: True
   list_length: 20
   k: 10
   relevance_threshold: 3 # doc is relevant if relevance >= this threshold
@@ -12,7 +12,7 @@ general:
   debug_freq: 100 # print debug statements every N steps
 
 training:
-    epochs: 50
+    epochs: 10
     batch_size: 100
     shuffle: True
     num_workers: 8
@@ -26,10 +26,10 @@ training:
 
 logging:
     save_checkpoint: True # save a checkpoint every epoch
-    experiment_tag: 'direct_ranker_lists_train'
-    load_checkpoint: False # use a saved checkpoint
+    experiment_tag: 'direct_ranker_pairs_test'
+    load_checkpoint: True # use a saved checkpoint
     resume_training: False # if false, discard everything except model weights
-    load_from_tag: 'direct_ranker_lists' # if you want to load from prev experiment
+    load_from_tag: 'direct_ranker_pairs_train' # if you want to load from prev experiment
 
 rank_model:
   xavier_init: False

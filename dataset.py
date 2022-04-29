@@ -78,6 +78,9 @@ class MSLR10KDataset(Dataset):
                         feature_vec.append(float(val))
                     self.queries[qid][label].append(feature_vec)
         for qid, query in dict(self.queries).items():
+            if len(query.keys()) < 2:
+                del self.queries[qid]
+                continue
             for label in range(5):
                 if label not in query:
                     continue
@@ -102,7 +105,7 @@ class MSLR10KDataset(Dataset):
             permuted_vectors = (permuted_vectors - permuted_vectors.mean(axis=1, keepdims=True)) / permuted_vectors.std(axis=1, keepdims=True)
             return permuted_vectors, sorted_relevances[permuted_indices]
         elif self.mode == "pair":
-            relevances = self.rng.choice(5, size=2, replace=False)
+            relevances = self.rng.choice(list(query.keys()), size=2, replace=False)
             pair = np.zeros((2, 136))
             pair[0] = self.rng.choice(query[relevances[0]])
             pair[1] = self.rng.choice(query[relevances[1]])

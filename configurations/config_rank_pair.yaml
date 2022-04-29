@@ -3,7 +3,7 @@ general:
   partition: "train"
   folds: ["Fold1"]
   seed: 0
-  mode: "list"
+  mode: "pair"
   run_eval_mode: False
   list_length: 20
   k: 10
@@ -26,7 +26,7 @@ training:
 
 logging:
     save_checkpoint: True # save a checkpoint every epoch
-    experiment_tag: 'direct_ranker_lists_train'
+    experiment_tag: 'direct_ranker_pairs_train'
     load_checkpoint: False # use a saved checkpoint
     resume_training: False # if false, discard everything except model weights
     load_from_tag: 'direct_ranker_lists' # if you want to load from prev experiment

@@ -1,6 +1,3 @@
-import math
-import yaml
-import json
 from types import SimpleNamespace
 from typing import List, Tuple
 
@@ -8,22 +5,18 @@ import torch
 from torch import Tensor
 from torch import nn
 from torch.nn import Module, Parameter
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
-from utilities import direct_sum, relax_sympy, max_sat
-from relaxations import relaxation_types
-from dataset import NeuroSATDataset, collate_adjacencies
-
-activations = {
-    'relu': nn.ReLU(), 'sigmoid': nn.Sigmoid(), 'tanh': nn.Tanh(), 'softmax': nn.Softmax(),
-    'identity': nn.Identity()
-}
+def activations(config: SimpleNamespace, activation: str):
+    activations_dict = {
+        'relu': nn.ReLU(), 'sigmoid': nn.Sigmoid(), 'tanh': nn.Tanh(), 'softmax': nn.Softmax(),
+        'identity': nn.Identity(), 'leakyrelu': nn.LeakyReLU(config.model.relu_leaky_slope),
+    }
+    return activations_dict[activation]
 
 class MultiLayerPerceptron(Module):
 
     def __init__(self, layer_dims: List[int], layer_activations: List[Module], p_dropout=0.0, bias=True,
-            xavier_init=True) -> None:
+            xavier_init=False) -> None:
         super().__init__()
         if not len(layer_dims) - 1 == len(layer_activations):
             raise ValueError("len(layer_dims) - 1 must equal len(layer_activations)")
@@ -48,125 +41,6 @@ class MultiLayerPerceptron(Module):
 
     def forward(self, input: Tensor) -> Tensor:
         return self.layers(input)
-
-
-class NeuroSATAssign(Module):
-
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.config = config
-        embedding_dim = config.model.embedding_dim
-        mlp_n_layers = config.model.mlp_hidden_layers
-        mlp_activation = activations[config.model.mlp_activation]
-        lstm_activation = activations[config.model.lstm_activation]
-
-        self.embedding_dim = embedding_dim
-        self.iterations = config.model.lstm_iters
-
-        self.L_init = Parameter(torch.normal(0, 1, (1, embedding_dim)) / math.sqrt(embedding_dim))
-        self.C_init = Parameter(torch.normal(0, 1, (1, embedding_dim)) / math.sqrt(embedding_dim))
-
-        layer_dims = [embedding_dim] * (mlp_n_layers + 1)
-        layer_activations = ([mlp_activation] * (mlp_n_layers - 1)) + [nn.Identity()] 
-        self.LC_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout,
-                xavier_init=config.model.xavier_init)
-        self.CL_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout,
-                xavier_init=config.model.xavier_init)
-
-        self.L_update = LayerNormLSTMCell(input_size=2*embedding_dim, hidden_size=embedding_dim, 
-                activation=lstm_activation, p_dropout=config.model.lstm_dropout)
-        self.C_update = LayerNormLSTMCell(input_size=embedding_dim, hidden_size=embedding_dim, 
-                activation=lstm_activation, p_dropout=config.model.lstm_dropout)
-
-        self.L_attention = CausalSelfAttention(config.model.attention_nheads, 2*embedding_dim, 
-                attn_pdrop=config.model.attention_pdrop)
-        self.L_assignments = MultiLayerPerceptron(
-                [2*embedding_dim]+[embedding_dim]*(mlp_n_layers-1)+[1], 
-                [mlp_activation]*(mlp_n_layers-1)+[activations['sigmoid']], 
-                p_dropout=config.model.mlp_dropout, xavier_init=config.model.xavier_init)
-        self.L_vote = MultiLayerPerceptron(
-                [2*embedding_dim]+[embedding_dim]*(mlp_n_layers-1)+[1], 
-                [mlp_activation]*(mlp_n_layers-1)+[activations['sigmoid']], 
-                p_dropout=config.model.mlp_dropout, xavier_init=config.model.xavier_init)
-
-
-    def forward(self, adjacency_matrices: Tensor, batch_lit_counts: Tensor, device=torch.device("cpu")):
-
-        self.device = device
-        # adjacency_matrices: B x L x C
-        B, L, C = adjacency_matrices.size()
-        L_embeddings = self.L_init.repeat((B, L, 1)) # B x L x D
-        C_embeddings = self.C_init.repeat((B, C, 1)) # B x C x D
-
-        L_state_init = (L_embeddings, torch.zeros_like(L_embeddings).to(device)) 
-        C_state_init = (C_embeddings, torch.zeros_like(C_embeddings).to(device))
-
-        flip = self.batched_flip(batch_lit_counts).to(device)
-        
-        L_state_final, C_state_final = self.iterate(adjacency_matrices, L_state_init, C_state_init, flip)
-        
-        lit_readouts = torch.cat((L_state_final[0], torch.matmul(flip, L_state_final[0])), dim=2) # B x L x 2D
-        lit_readouts = self.pos_lit_select(lit_readouts, batch_lit_counts) # B x L//2 x 2D
-
-        mask = self.literals_mask_1d((batch_lit_counts / 2).int()).to(device)
-        
-        assignments = self.L_assignments(lit_readouts)
- 
-        if self.config.model.use_attention:
-            lit_readouts = self.L_attention(lit_readouts, mask=mask) # B x L//2 x 2D
-
-        votes = self.L_vote(lit_readouts)
-
-        assignments = assignments.squeeze(-1).masked_fill(mask == 0., 0.)
-        votes = votes.squeeze(-1).masked_fill(mask == 0., 0.)
-
-        vote_means = torch.sum(votes, axis=1) / (batch_lit_counts / 2)
-
-        return vote_means, assignments
-
-    def iterate(self, adjacency_matrices, L_state_init, C_state_init, flip_mtrx):
-        L_state = L_state_init
-        C_state = C_state_init
-        
-        for itr in range(self.iterations):
-            LC_messages = torch.matmul(adjacency_matrices.transpose(1,2), self.LC_msg(L_state[0]))
-            _, C_state = self.C_update(input=LC_messages, state=C_state)
-
-            CL_messages = torch.matmul(adjacency_matrices, self.CL_msg(C_state[0])) 
-            _, L_state = self.L_update(input=torch.cat((CL_messages, torch.matmul(flip_mtrx, L_state[0])), dim=2), 
-                    state=L_state)
-        return L_state, C_state
-
-    def batched_flip(self, batch_counts) -> Tensor: 
-        flip_matrices = []
-        max_n = max(batch_counts)
-        for batch_lits in batch_counts:
-            n = batch_lits
-            eye = torch.eye(n)
-            flip_eye = torch.cat((eye[n//2:n], eye[0:n//2]))
-            flip_eye = F.pad(flip_eye, (0, max_n - n, 0, max_n - n))
-            flip_matrices.append(flip_eye)
-        permute = torch.stack(flip_matrices)
-        return permute
-        
-    def pos_lit_select(self, lit_embeddings, batch_counts) -> Tensor:
-        B, L, D = lit_embeddings.size()
-        lit_embeddings = lit_embeddings[:, :L//2, :]
-        masks = []
-        for b_n in batch_counts:
-            mask = []
-            mask.extend([True] * (b_n//2))
-            mask.extend([False] * (L//2 - b_n//2))
-            masks.append(torch.tensor(mask))
-        masks = torch.stack(masks).unsqueeze(2).to(self.device)
-        return torch.where(masks, lit_embeddings, torch.zeros_like(lit_embeddings))
-
-    def literals_mask_1d(self, batch_counts) -> Tensor:
-        masks = torch.zeros(size=(len(batch_counts), torch.max(batch_counts)), dtype=torch.float32)
-        for b_idx, b_n in enumerate(batch_counts):
-            masks[b_idx][0 : b_n] = 1.
-        return masks # B x L
-            
 
 class LayerNormLSTMCell(Module):
 
@@ -199,89 +73,19 @@ class LayerNormLSTMCell(Module):
 
         return hy, (hy, cy)
 
-
-class CausalSelfAttention(nn.Module):
-    """
-    A vanilla multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
-    """
-
-    def __init__(self, n_head, embedding_dim, attn_pdrop=0.0):
-        super().__init__()
-        assert embedding_dim % n_head == 0
-        # key, query, value projections for all heads
-        self.key = nn.Linear(embedding_dim, embedding_dim)
-        self.query = nn.Linear(embedding_dim, embedding_dim)
-        self.value = nn.Linear(embedding_dim, embedding_dim)
-        # regularization
-        self.attn_drop = nn.Dropout(p=attn_pdrop)
-        self.n_head = n_head
-
-    def forward(self, x, mask):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        if mask is not None:
-            square_mask = torch.matmul(mask.view(B, -1, 1), mask.view(B, 1, -1)) # (B,T,1) x (B, 1, T) -> (B, T, T)
-            square_mask = square_mask.unsqueeze(dim=1)
-            att = att.masked_fill(square_mask == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = att.masked_fill(att.isnan(), 0.)
-
-        att = self.attn_drop(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        return y # (B, T, C)
-
-
-class NeuroSATLoss(Module):
-    
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.relaxation_t = relaxation_types[config.general.relaxation]
-        self.criterion = nn.BCELoss()
-
-    def forward(self, assignments, formulas, sats, device):
-        
-        max_satisfactions = torch.tensor([len(f.args) for f in formulas], device=device).float()
-        satisfactions = torch.tensor([max_sat(f, a, device) for a, f in zip(assignments, formulas)], device=device)
-        loss = max_satisfactions - satisfactions
-        return torch.mean(loss)
-
-
 if __name__ == "__main__":
-    with open("config.yaml") as yaml_reader:
-        config = yaml.safe_load(yaml_reader)
-        config = json.loads(json.dumps(config), object_hook=lambda d : SimpleNamespace(**d))
-    
-    dataset = NeuroSATDataset(root_dir="datasets/development", partition="train")
+    mlp_model = MultiLayerPerceptron([64, 128, 128, 64], [nn.ReLU()] * 3, p_dropout=0.1, bias=True,
+        xavier_init=False)
+    print(mlp_model)
 
-    adjacencies, literals, formulas, sats = collate_adjacencies([dataset[3], dataset[5]])
-    print(adjacencies.shape, literals)
-    adjacencies.requires_grad = True
-    
-    model = NeuroSATAssign(config)
-    print(model)
-    optim = torch.optim.Adam(model.parameters())
-    optim.zero_grad()
+    layernorm_lstm = LayerNormLSTMCell(64, 128)
+    print(layernorm_lstm)
 
-    votes, assignments = model(adjacencies, literals)
-    print(votes, assignments)
-    print(assignments[0].shape, assignments[1].shape)
-    #torch.sum(assignments[0] + assignments[1]).backward()
+    B, I = 10, 64
 
-    #print(model.L_init)
-    #optim.step()
-    #print(model.L_init)
-    #print(adjacencies.grad)
-    print(model.L_assignments(torch.zeros(256)))
+    mlp_out = mlp_model(torch.rand((B,I)))
+    print(mlp_out)
+
+    lstm_out = layernorm_lstm(torch.rand((B,I)), (torch.rand((B,I*2)), torch.rand((B,I*2))))
+    print(lstm_out)
 
