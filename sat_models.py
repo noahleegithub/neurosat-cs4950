@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
-from models import activations, MultiLayerPerceptron, LayerNormLSTMCell
+from models import activations, MultiLayerPerceptron, LayerNormLSTMCell, LayerNormGRUCell
 from utilities import max_sat
 from relaxations import relaxations
 from dataset import NeuroSATDataset, collate_adjacencies
@@ -18,15 +18,13 @@ class NeuroMaxSAT(Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        self.config = config
         self.device = torch.device("cuda" if config.training.use_cuda and torch.cuda.is_available() else "cpu")
-        embedding_dim = config.model.embedding_dim
-        mlp_n_layers = config.model.mlp_hidden_layers
-        mlp_activation = activations(config, config.model.mlp_activation)
-        lstm_activation = activations(config, config.model.lstm_activation)
+        embedding_dim = config.maxsat_model.hidden_dim
+        mlp_n_layers = config.maxsat_model.mlp_layers
+        mlp_activation = activations(config, config.maxsat_model.mlp_activation)
+        lstm_activation = activations(config, config.maxsat_model.rnn_activation)
 
-        self.embedding_dim = embedding_dim
-        self.iterations = config.model.lstm_iters
+        self.iterations = config.maxsat_model.rnn_iters
 
         self.L_pos_init = Parameter(torch.normal(0, 1, (1, embedding_dim)) / math.sqrt(embedding_dim))
         self.L_neg_init = Parameter(torch.normal(0, 1, (1, embedding_dim)) / math.sqrt(embedding_dim))
@@ -34,19 +32,17 @@ class NeuroMaxSAT(Module):
 
         layer_dims = [embedding_dim] * (mlp_n_layers + 1)
         layer_activations = [mlp_activation] * mlp_n_layers
-        self.LC_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout,
-                xavier_init=config.model.xavier_init)
-        self.CL_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.model.mlp_dropout,
-                xavier_init=config.model.xavier_init)
+        self.LC_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.maxsat_model.p_dropout,
+                xavier_init=config.maxsat_model.xavier_init)
+        self.CL_msg = MultiLayerPerceptron(layer_dims, layer_activations, p_dropout=config.maxsat_model.p_dropout,
+                xavier_init=config.maxsat_model.xavier_init)
 
         self.L_update = LayerNormLSTMCell(input_size=2*embedding_dim, hidden_size=embedding_dim, 
-                activation=lstm_activation, p_dropout=config.model.lstm_dropout)
+                activation=lstm_activation, p_dropout=config.maxsat_model.p_dropout, forget_bias=config.maxsat_model.forget_bias)
         self.C_update = LayerNormLSTMCell(input_size=embedding_dim, hidden_size=embedding_dim, 
-                activation=lstm_activation, p_dropout=config.model.lstm_dropout)
+                activation=lstm_activation, p_dropout=config.maxsat_model.p_dropout, forget_bias=config.maxsat_model.forget_bias)
 
-        self.L_assignments = DirectRanker(config.model.embedding_dim, config.model.embedding_dim, 
-            config.model.mlp_hidden_layers, p_drop=config.model.mlp_dropout, xavier_init=config.model.xavier_init,
-            leaky_slope=config.model.relu_leaky_slope)
+        self.L_assignments = DirectRanker(config, in_dim=embedding_dim)
 
 
     def forward(self, adjacency_matrices: Tensor, batch_lit_counts: Tensor):
@@ -74,11 +70,12 @@ class NeuroMaxSAT(Module):
         neg_lits = (lit_readouts * neg_lits_mask)[:,:L//2] # (B, L//2, D)
         lit_assignments = torch.stack((pos_lits, neg_lits), dim=2) # (B, L//2, 2, D)
 
-        lit_assignments = self.L_assignments(lit_assignments) # (B, L//2, 1)
+        lit_diffs, pos_vals, neg_vals = self.L_assignments(lit_assignments) # (B, L//2, 1)
     
-        lit_assignments = lit_assignments * pos_lits_mask[:,:L//2]
+        lit_diffs = lit_diffs * pos_lits_mask[:,:L//2]
+        pos_vals = pos_vals * pos_lits_mask[:,:L//2]
 
-        return lit_assignments
+        return lit_diffs, pos_vals
 
     def iterate(self, adjacency_matrices, L_state_init, C_state_init, flip_mtrx):
         L_hidden, L_cell = L_state_init
@@ -121,7 +118,6 @@ class MaxSATLoss(Module):
     
     def __init__(self, config):
         super().__init__()
-        self.config = config
         self.relaxation = relaxations(config)
         self.device = torch.device("cuda" if config.training.use_cuda and torch.cuda.is_available() else "cpu")
 

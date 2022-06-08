@@ -9,6 +9,9 @@ from sympy.logic.boolalg import BooleanFunction, Not
 from sympy.logic.utilities import dimacs
 from relaxations import FuzzyAggregator, Lukasiewicz
 
+def ndarray_to_tuples(arr: np.ndarray):
+    return tuple(ndarray_to_tuples(a) if isinstance(a, np.ndarray) else a for a in arr)
+
 def append_dict_to_csv(results_dict, csv_path, sep=","):
     with open(csv_path, 'a') as f:
         writer = csv.DictWriter(f, fieldnames=list(results_dict.keys()))
@@ -40,6 +43,29 @@ def dimacs_to_adjacency(in_fname: str, sparse: bool=True):
         if sparse:
             adj_tensor = adj_tensor.to_sparse()
         return adj_tensor
+
+def sympy_to_weighted_adjacency(cnf: BooleanFunction, variable_weights: Tensor, sparse=False, device=torch.device("cpu")):
+    n_vars = len(variable_weights)
+    n_clauses = len(cnf.args)
+
+    adj_mtrx = torch.zeros((2 * n_vars, n_clauses), device=device).float()
+
+    for clause_idx, clause in enumerate(cnf.args):
+        if isinstance(clause, Symbol): lits = [clause]
+        else: lits = clause.args
+        for lit in lits:
+            negated = isinstance(lit, Not)
+            if negated: lit = lit.args[0]
+            pos_idx = extract_int_from_str(lit.name) - 1
+            neg_idx = extract_int_from_str(lit.name) - 1 + n_vars
+            weight = variable_weights[pos_idx]
+            if negated: weight = 1 - weight
+            adj_mtrx[pos_idx, clause_idx] = weight
+            adj_mtrx[neg_idx, clause_idx] = 1 - weight
+
+    if sparse:
+        adj_mtrx = adj_mtrx.to_sparse()
+    return adj_mtrx
 
 def pad_sparse_matrix(matrix: Tensor, new_w, new_h) -> Tensor:
     return torch.sparse_coo_tensor(
@@ -100,9 +126,11 @@ def max_sat(values: Tensor, cnf: BooleanFunction, relaxation: FuzzyAggregator, d
     return cnf_satisfaction
 
 def ndcg_score(relevance_ranking: Tensor, optimal_ranking: Tensor=None, k: int=None, debug=False):
+    relevance_ranking = relevance_ranking.cpu()
     if k is None or k > len(relevance_ranking):
         k = len(relevance_ranking)
-    relevance_ranking = relevance_ranking[:k].cpu()
+    
+    relevance_ranking = relevance_ranking[:k]
 
     if optimal_ranking is not None: optimal_ranking = optimal_ranking.cpu()
     else: optimal_ranking, _ = torch.sort(relevance_ranking, descending=True)
@@ -115,18 +143,20 @@ def ndcg_score(relevance_ranking: Tensor, optimal_ranking: Tensor=None, k: int=N
     dcg = dcg_score(relevance_ranking)
     idcg = dcg_score(optimal_ranking)
     if debug: print(dcg, idcg)
-    return dcg / idcg # Can return NaN!
+    if idcg == 0:
+        return 0
+    return dcg / idcg
 
 def average_precision(ranking: Tensor, k: int=None):
     ranking = ranking.cpu()
     if k is None or k > len(ranking):
         k = len(ranking)
-    # ranking is binarized
     ranking = ranking[:k]
     gtp = torch.sum(ranking)
-    
+    if gtp == 0:
+        return 0
     p_at_k = torch.tril(ranking.view(1,-1).expand((k,-1)), diagonal=1).sum(axis=1) / torch.arange(1, k+1).float()
-    return torch.sum(p_at_k * ranking) / gtp # Can return NaN!
+    return torch.sum(p_at_k * ranking) / gtp
 
 
 def combinations_2(data: np.ndarray, batched=True):

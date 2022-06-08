@@ -91,7 +91,7 @@ class MSLR10KDataset(Dataset):
     
     def __getitem__(self, idx):
         query = self.queries[self.idx2qid[idx]]
-        if self.mode == "list":
+        if self.mode == "list" or self.mode == "maxsat":
             sorted_results = np.zeros((self.k, self.d))
             sorted_relevances = np.sort(self.rng.choice(list(query.keys()), size=self.k))[::-1]
             for idx, relevance in enumerate(sorted_relevances):

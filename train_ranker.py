@@ -4,6 +4,7 @@ import yaml
 import json
 import os
 from types import SimpleNamespace
+from sat_models import MaxSATLoss, NeuroMaxSAT
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -11,8 +12,8 @@ import numpy as np
 from dataset import MSLR10KDataset
 from torch.utils.data import DataLoader
 from torch import nn
-from ranking_models import DirectRanker
-from utilities import average_precision, combinations_2, ndcg_score, append_dict_to_csv
+from ranking_models import DirectRanker, MaxSATRanker
+from utilities import average_precision, clause_accuracy, combinations_2, ndcg_score, append_dict_to_csv
 
 def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, criterion: any, config, device=torch.device("cpu")):
 
@@ -45,32 +46,109 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
         }
     elif config.general.mode == "list":
         B, N, D = features.shape
-        pairwise_indices = combinations_2(np.arange(N), batched=False) # (NC2, 2)
-        pairwise_features = combinations_2(features) # (B, NC2, 2, D)
-        pairwise_targets = combinations_2(targets) # (B, NC2, 2)
 
-        # if x > y, 1. if x == y, 0.5, if x < y, 0.
-        pairwise_targets = torch.where(
-            pairwise_targets[:,:,0] > pairwise_targets[:,:,1], 1., 
-                pairwise_targets[:,:,0] == pairwise_targets[:,:,1], 0.5, 0.) # (B, NC2)
-        pairwise_predictions = model(pairwise_features).squeeze() # (B, NC2, 2, D) -> (B, NC2, 1) -> (B, NC2)
-        
-        # backprop
-        loss = criterion(pairwise_predictions, pairwise_targets)
-        
-        if not config.general.run_eval_mode:
-            loss.backward()
-            if config.training.optimizer.use_grad_clip:
-                nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
-            optimizer.step()    
+        with torch.cuda.amp.autocast():
+            pairwise_indices = combinations_2(np.arange(N), batched=False) # (NC2, 2)
+            pairwise_features = combinations_2(features) # (B, NC2, 2, D)
+            pairwise_targets = combinations_2(targets) # (B, NC2, 2)
+
+            # if x > y, 1. if x == y, 0.5, if x < y, 0.
+            pairwise_targets_comp = pairwise_targets[:,:,0] - pairwise_targets[:,:,1]
+            pairwise_targets_comp[pairwise_targets_comp > 0] = 1.0
+            pairwise_targets_comp[pairwise_targets_comp == 0] = 0.5
+            pairwise_targets_comp[pairwise_targets_comp < 0] = 0.0
+            
+            pair_comparisons, predicted_relevances_1, predicted_relevances_2 = model(pairwise_features) # (B, NC2, 2, D) -> (B, NC2, 1) -> (B, NC2)
+            pair_comparisons, predicted_relevances_1, predicted_relevances_2 = pair_comparisons.squeeze(), predicted_relevances_1.squeeze(), predicted_relevances_2.squeeze()
+            # backprop
+
+            _, inverse_indices = np.unique(pairwise_indices, return_index=True)
+            predicted_relevances = torch.cat((predicted_relevances_1, predicted_relevances_2), axis=1)[:, inverse_indices]
+            targets_ndcg = targets.int()
+            targets_map = targets.int()
+            targets_ndcg = targets_ndcg.cpu().apply_(lambda x: vars(config.ndcg_hash)[str(x)])
+            targets_map = targets_map.cpu().apply_(lambda x: vars(config.map_hash)[str(x)])
+            targets_ndcg = targets_ndcg.float().to(device)
+            targets_map = targets_map.float().to(device)
+
+            loss = criterion(predicted_relevances, targets_ndcg.float().to(device))
+            
+            if not config.general.run_eval_mode:
+                loss.backward()
+                if config.training.optimizer.use_grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
+                optimizer.step()    
         # backprop
 
         batch_ndcgs = []
         batch_aps = []
 
         for batch in range(B):
+            model_predictions = pair_comparisons[batch] # (NC2)
+            lookup_table = np.zeros((N, N))
+            for idx, (x, y) in enumerate(pairwise_indices):
+                lookup_table[x, y] = model_predictions[idx]
+                lookup_table[y, x] = -1 * model_predictions[idx]
+
+            def pairwise_comparator(x, y):
+                return lookup_table[x, y]
+
+            relevances_argsort = sorted(np.arange(N), key=cmp_to_key(pairwise_comparator), reverse=True)
+            resorted_relevances = predicted_relevances[batch][relevances_argsort]
+            batch_ndcgs.append(ndcg_score(resorted_relevances.detach().float(), optimal_ranking=targets_ndcg[batch][relevances_argsort], k=config.general.k))
+            batch_aps.append(average_precision(targets_map[batch][relevances_argsort], k=config.general.k))
+
+        if config.general.debug and step_no % config.general.debug_freq == 0: 
+            print(resorted_relevances, batch_ndcgs[-1], batch_aps[-1])
+
+        predictions = pair_comparisons[:]
+        predictions[pair_comparisons > 0] = 1.0
+        predictions[pair_comparisons == 0] = 0.5
+        predictions[pair_comparisons < 0] = 0.0
+        correct = predictions == pairwise_targets_comp  
+
+        results = {
+            'step': step_no,
+            'accuracy': (torch.sum(correct) / torch.numel(correct)).item(), 
+            'loss': loss.item(),
+            'ndcg@{}'.format(config.general.k): np.nanmean(batch_ndcgs),
+            'map@{}'.format(config.general.k): np.nanmean(batch_aps),
+        }
+    elif config.general.mode == "maxsat":
+        B, N, D = features.shape
+        pairwise_criterion, maxsat_criterion = criterion
+        pairwise_indices = combinations_2(np.arange(N), batched=False) # (NC2, 2)
+
+
+        with torch.cuda.amp.autocast():
+            pairwise_targets = combinations_2(targets) # (B, NC2, 2)
+
+            # if x > y, 1. if x == y, 0.5, if x < y, 0.
+            pairwise_targets_comp = pairwise_targets[:,:,0] - pairwise_targets[:,:,1]
+            pairwise_targets_comp[pairwise_targets_comp > 0] = 1.0
+            pairwise_targets_comp[pairwise_targets_comp == 0] = 0.5
+            pairwise_targets_comp[pairwise_targets_comp < 0] = 0.0
+        
+            ranker_predictions, maxsat_assignments, formulas = model(features)
+
+            pairwise_loss = pairwise_criterion(ranker_predictions, pairwise_targets_comp)
+            sat_loss = maxsat_criterion(maxsat_assignments, formulas)
+            
+            if not config.general.run_eval_mode:
+                (pairwise_loss * config.training.pairwise_alpha).backward(retain_graph=True)
+                (sat_loss * config.training.sat_alpha).backward()
+                if config.training.optimizer.use_grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), config.training.optimizer.clip_grad_norm)
+                optimizer.step()   
+            
+            loss = config.training.pairwise_alpha * pairwise_loss + config.training.sat_alpha * sat_loss
+
+        batch_ndcgs = []
+        batch_aps = []
+
+        for batch in range(B):
             permuted_relevances = targets[batch] # (N,)
-            model_predictions = pairwise_predictions[batch] # (NC2)
+            model_predictions = maxsat_assignments[batch] # (NC2)
             lookup_table = np.zeros((N, N))
             for idx, (x, y) in enumerate(pairwise_indices):
                 lookup_table[x, y] = model_predictions[idx]
@@ -81,22 +159,22 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
 
             relevances_argsort = sorted(np.arange(N), key=cmp_to_key(pairwise_comparator), reverse=True)
             resorted_relevances = permuted_relevances[relevances_argsort]
-            batch_ndcgs.append(ndcg_score(resorted_relevances, k=config.general.k))
-            binarized_relevances = torch.where(resorted_relevances >= config.general.relevance_threshold, 1., 0.)
-            batch_aps.append(average_precision(binarized_relevances, k=config.general.k))
+            batch_ndcgs.append(ndcg_score(resorted_relevances, vars(config.ndcg_hash), k=config.general.k))
+            batch_aps.append(average_precision(resorted_relevances, vars(config.map_hash), k=config.general.k))
 
         if config.general.debug and step_no % config.general.debug_freq == 0: 
+            print(maxsat_assignments[-1])
             print(resorted_relevances, batch_ndcgs[-1], batch_aps[-1])            
+
+        batch_acc = clause_accuracy(maxsat_assignments, formulas, device)
 
         results = {
             'step': step_no,
-            'accuracy': 0, 
+            'accuracy': batch_acc.item(), 
             'loss': loss.item(),
             'ndcg@{}'.format(config.general.k): np.nanmean(batch_ndcgs),
             'map@{}'.format(config.general.k): np.nanmean(batch_aps),
         }
-    else:
-        raise NotImplementedError()
 
     return step_no + 1, results
 
@@ -160,9 +238,11 @@ if __name__ == "__main__":
             num_workers=config.training.num_workers)
 
     # init model
-    model = DirectRanker(config.rank_model.input_dim, config.rank_model.mlp_hidden_dim, config.rank_model.mlp_n_layers, 
-        p_drop=config.rank_model.mlp_p_dropout, xavier_init=config.rank_model.xavier_init, 
-        leaky_slope=config.rank_model.leaky_slope)
+    model = DirectRanker(config)
+
+    if config.general.mode == "maxsat":
+        constraint_solver = NeuroMaxSAT(config)
+        model = MaxSATRanker(config, model, constraint_solver)
 
     #assert config.training.optimizer.step_rule == "AdamW", "AdamW is currently the only optimizer supported"
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.optimizer.learning_rate, 
@@ -171,7 +251,11 @@ if __name__ == "__main__":
     # Squared sign loss, sign loss, maybe 0-1 loss?
     #criterion = lambda pred, target: torch.mean(torch.square(torch.minimum(pred * target, torch.zeros_like(pred))))
     #criterion = lambda pred, target: torch.mean(torch.minimum(pred * target, torch.zeros_like(pred)))
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.MSELoss()
+    
+    if config.general.mode == "maxsat":
+        criterion = (criterion, MaxSATLoss(config))
+        pass
 
     step_no = 0
 

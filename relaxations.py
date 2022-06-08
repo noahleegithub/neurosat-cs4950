@@ -65,10 +65,10 @@ class Yager(FuzzyAggregator):
         ''' Universal aggregator, i.e. "for all" in a Boolean formula. Analogous to n-ary conjunction. 
             This is the relaxed form, where outputs can be negative.
         '''
-        return 1 - (len(inputs) - torch.sum(inputs**self.p)**(1 / self.p))
+        return 1 - len(inputs) - torch.linalg.norm(inputs, ord=self.p)
 
     def existential(self, inputs):
-        return torch.minimum(torch.sum(inputs**self.p)**(1 / self.p), torch.tensor(1, device=self.device))
+        return torch.minimum(torch.linalg.norm(inputs, ord=self.p), torch.tensor(1, device=self.device))
 
 def relaxations(config):
     device = torch.device("cuda" if config.training.use_cuda and torch.cuda.is_available() else "cpu")

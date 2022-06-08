@@ -1,0 +1,63 @@
+general:
+  dataset_root: "datasets/MSLR-WEB10K"
+  partition: "train"
+  folds: ["Fold1"]
+  seed: 0
+  mode: "list"
+  run_eval_mode: False
+  list_length: 10
+  k: 10
+  debug: True
+  debug_freq: 25 # print debug statements every N steps
+
+relaxations:
+  relaxation: "lukasiewicz"
+  yager_p: 1.5
+  godel_soft: False
+
+training:
+    epochs: 50
+    batch_size: 128
+    shuffle: True
+    num_workers: 8
+    use_cuda: True
+    optimizer:
+        step_rule: "AdamW"
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        use_grad_clip: False
+        clip_grad_norm: 1.0
+    pairwise_alpha: 1.0
+    sat_alpha: 1.0
+
+logging:
+    save_checkpoint: True # save a checkpoint every epoch
+    experiment_tag: 'list_testing'
+    load_checkpoint: False # use a saved checkpoint
+    resume_training: False # if false, discard everything except model weights
+    load_from_tag: 'direct_ranker_lists' # if you want to load from prev experiment
+
+rank_model:
+  xavier_init: False
+  input_dim: 136
+  mlp_layers: 3
+  hidden_dim: 128
+  p_dropout: 0.1
+  mlp_activation: "leakyrelu"
+
+maxsat_model:
+  xavier_init: False
+  hidden_dim: 128
+  mlp_layers: 3
+  mlp_activation: "leakyrelu"
+  p_dropout: 0.1
+  rnn_iters: 8
+  rnn_activation: "tanh"
+  forget_bias: 1.0
+  reset_bias: -1.0
+
+activations:
+  leaky_slope: 0.01
+
+ndcg_hash: {'4': 15, '3': 7, '2': 3, '1': 1, '0': 0}
+map_hash: {'4': 1, '3': 1, '2': 1, '1': 0, '0': 0}

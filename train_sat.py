@@ -22,7 +22,8 @@ def train_step(step_no: int, data_in: any, model: nn.Module, optimizer: any, cri
     adj_matrices, sats = adj_matrices.to(device), sats.to(device)
 
     with torch.cuda.amp.autocast():
-        assignments = model(adj_matrices, batch_counts).squeeze() # (B, L, L) -> (B, V, 1) -> (B, V)
+        assignments, _ = model(adj_matrices, batch_counts) # (B, L, L) -> (B, V, 1) -> (B, V)
+        assignments = assignments.squeeze()
 
         loss = criterion(assignments, formulas)
         
